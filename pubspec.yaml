@@ -33,9 +33,12 @@ dependencies:
 
   cupertino_icons: ^1.0.8
   document_scanner_flutter: ^0.4.0
+  image_picker: ^1.1.2
+  intl: ^0.20.2
+  open_file: ^3.2.1
   path_provider: ^2.0.15
   path: ^1.8.4
-  open_file: ^3.2.1
+  pdf: ^3.11.1
   permission_handler: ^11.3.0
 
 dev_dependencies:
