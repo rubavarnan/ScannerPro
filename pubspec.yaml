@@ -40,6 +40,8 @@ dependencies:
   path: ^1.8.4
   pdf: ^3.11.1
   permission_handler: ^11.3.0
+  cunning_document_scanner: ^3.0.3
+  image: ^4.3.0
 
 dev_dependencies:
   flutter_test:

@@ -1,12 +1,14 @@
 import 'dart:io';
 import 'dart:ui' as ui;
 
-import 'package:document_scanner_flutter/configs/configs.dart';
-import 'package:document_scanner_flutter/document_scanner_flutter.dart';
+import 'package:cunning_document_scanner/cunning_document_scanner.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:open_file/open_file.dart';
 import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
+import 'package:pdf/pdf.dart' as pdf_lib;
 import 'package:pdf/widgets.dart' as pw;
 import 'package:permission_handler/permission_handler.dart';
 
@@ -54,6 +56,33 @@ class StorageService {
         : Directory(path.join(Directory.current.path, 'Scanner Pro'));
     await root.create(recursive: true);
     return root;
+  }
+
+  Future<Directory> downloads() async {
+    if (Platform.isAndroid) {
+      final downloads = await getDownloadsDirectory();
+      if (downloads != null) {
+        final dir = Directory(path.join(downloads.path, 'Scanner Pro'));
+        await dir.create(recursive: true);
+        return dir;
+      }
+
+      final fallback = Directory('/storage/emulated/0/Download/Scanner Pro');
+      await fallback.create(recursive: true);
+      return fallback;
+    }
+
+    if (Platform.isWindows) {
+      final home = Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'] ?? '.';
+      final dir = Directory(path.join(home, 'Downloads', 'Scanner Pro'));
+      await dir.create(recursive: true);
+      return dir;
+    }
+
+    final dir = await getApplicationDocumentsDirectory();
+    final downloads = Directory(path.join(dir.path, 'Downloads', 'Scanner Pro'));
+    await downloads.create(recursive: true);
+    return downloads;
   }
 
   Future<List<DocumentFolder>> documents() async {
@@ -182,6 +211,33 @@ class _HomePageState extends State<HomePage> {
     _refresh();
   }
 
+  Future<void> _delete(DocumentFolder document) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete document?'),
+        content: Text('This will delete "${document.name}" and all its scanned files.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    if (await document.directory.exists()) {
+      await document.directory.delete(recursive: true);
+    }
+    _refresh();
+  }
+
   Future<void> _menu(DocumentFolder document) async {
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -199,11 +255,17 @@ class _HomePageState extends State<HomePage> {
               title: const Text('Rename'),
               onTap: () => Navigator.pop(sheetContext, 'rename'),
             ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: const Text('Delete'),
+              onTap: () => Navigator.pop(sheetContext, 'delete'),
+            ),
           ],
         ),
       ),
     );
     if (action == 'rename') await _rename(document);
+    if (action == 'delete') await _delete(document);
     if (action == 'preview' && mounted) {
       await Navigator.push(
         context,
@@ -283,7 +345,7 @@ class _HomePageState extends State<HomePage> {
                   : ListView.separated(
                       padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
                       itemCount: _filteredDocuments.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 8),
+                      separatorBuilder: (_, _) => const SizedBox(height: 8),
                       itemBuilder: (context, index) {
                         final document = _filteredDocuments[index];
                         return ListTile(
@@ -316,6 +378,26 @@ class DocumentPage extends StatefulWidget {
   final DocumentFolder document;
   const DocumentPage({required this.document, super.key});
 
+  static const Map<String, double> pdfScales = {
+    'Actual': 1.0,
+    'Medium': 0.8,
+    'Small': 0.6,
+    'Smallest': 0.5,
+  };
+
+  static String _formatBytesLabel(int bytes) {
+    if (bytes < 1024) return '${bytes}B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).round()}KB';
+    final megabytes = bytes / (1024 * 1024);
+    return '${megabytes.round()}MB';
+  }
+
+  static String sizeLabel(String key, int totalBytes) {
+    final scale = pdfScales[key] ?? 1.0;
+    final scaledBytes = (totalBytes * scale).round();
+    return '$key - ${_formatBytesLabel(scaledBytes)}';
+  }
+
   @override
   State<DocumentPage> createState() => _DocumentPageState();
 }
@@ -323,12 +405,8 @@ class DocumentPage extends StatefulWidget {
 class _DocumentPageState extends State<DocumentPage> {
   bool processing = false;
   late String _currentName;
-  static const Map<String, double> pdfScales = {
-    'Actual': 1.0,
-    'Medium': 0.8,
-    'Small': 0.6,
-    'Smallest': 0.5,
-  };
+
+  int get _documentBytes => images.fold<int>(0, (sum, file) => sum + file.lengthSync());
 
   List<File> get images => widget.document.images;
 
@@ -351,78 +429,37 @@ class _DocumentPageState extends State<DocumentPage> {
     return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
   }
 
-  String? _extractScannedFilePath(dynamic result) {
-    if (result == null) return null;
-    if (result is File) return result.path;
-    if (result is String) return result;
-    if (result is Map) {
-      final direct = result['filePath'] ?? result['path'];
-      if (direct is String) return direct;
-      if (direct is File) return direct.path;
-      final scannedFiles = result['scannedFiles'];
-      if (scannedFiles is List && scannedFiles.isNotEmpty) {
-        final first = scannedFiles.first;
-        if (first is File) return first.path;
-        if (first is String) return first;
-      }
-    }
-    if (result is List && result.isNotEmpty) {
-      final first = result.first;
-      if (first is File) return first.path;
-      if (first is String) return first;
-    }
-    return null;
-  }
-
   Future<void> _add(ImageSource source) async {
-    if (source == ImageSource.camera) {
-      final result = await DocumentScannerFlutter.launch(
-        context,
-        source: ScannerFileSource.CAMERA,
-      );
-      final filePath = _extractScannedFilePath(result);
-      if (filePath == null) return;
+    final scannerSource = source == ImageSource.camera
+        ? ScannerSource.camera
+        : ScannerSource.gallery;
 
-      final scanned = File(filePath);
-      if (!await scanned.exists()) return;
-
-      final save = await showDialog<bool>(
-        context: context,
-        builder: (_) => AlertDialog(
-          title: const Text('Add to document?'),
-          content: SizedBox(
-            width: double.maxFinite,
-            child: Image.file(scanned),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context, false),
-              child: const Text('Cancel'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(context, true),
-              child: const Text('Select'),
-            ),
-          ],
-        ),
+    try {
+      final scannedPaths = await CunningDocumentScanner.getPictures(
+        scannerSource: scannerSource,
+        noOfPages: 50,
       );
 
-      if (save != true) {
-        await scanned.delete();
-        return;
+      if (scannedPaths == null || scannedPaths.isEmpty) return;
+
+      var nextIndex = images.length + 1;
+      for (final scannedPath in scannedPaths) {
+        final scannedFile = File(scannedPath);
+        if (!await scannedFile.exists()) continue;
+
+        final target = File(path.join(widget.document.directory.path, '${nextIndex++}.jpg'));
+        await scannedFile.copy(target.path);
       }
 
-      final target = File(path.join(widget.document.directory.path, '${images.length + 1}.jpg'));
-      await scanned.copy(target.path);
+      await CunningDocumentScanner.cleanCache();
       if (mounted) setState(() {});
-      return;
+    } on CunningDocumentScannerException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(error.message)),
+        );
+      }
     }
-
-    final picked = await ImagePicker().pickImage(source: source, imageQuality: 85);
-    if (picked == null) return;
-    final target = File(path.join(widget.document.directory.path, '${images.length + 1}.jpg'));
-    await File(picked.path).copy(target.path);
-    if (mounted) setState(() {});
   }
 
   Future<void> _remove(File file) async {
@@ -454,8 +491,9 @@ class _DocumentPageState extends State<DocumentPage> {
         ],
       ),
     );
-    final clean = value?.trim().replaceAll(RegExp(r'[<>:"/\\|?*]'), '-');
-    if (clean == null || clean.isEmpty || clean == _currentName) return;
+    final rawName = value?.trim().replaceAll(RegExp(r'[<>:"/\\|?*]'), '-');
+    if (rawName == null || rawName.isEmpty || rawName == _currentName) return;
+    final clean = rawName;
     final destination = Directory(path.join(widget.document.directory.parent.path, clean));
     if (await destination.exists()) {
       if (mounted) {
@@ -467,12 +505,11 @@ class _DocumentPageState extends State<DocumentPage> {
     }
     await widget.document.directory.rename(destination.path);
     widget.document.directory = destination;
+    if (!mounted) return;
     setState(() => _currentName = clean);
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Renamed to $clean')),
-      );
-    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Renamed to $clean')),
+    );
   }
 
   Future<void> _savePdf([double scaleFactor = 1.0]) async {
@@ -480,25 +517,114 @@ class _DocumentPageState extends State<DocumentPage> {
     setState(() => processing = true);
     try {
       final pdf = pw.Document();
+      final pageFormat = pdf_lib.PdfPageFormat.standard.copyWith(
+        width: pdf_lib.PdfPageFormat.standard.width * scaleFactor,
+        height: pdf_lib.PdfPageFormat.standard.height * scaleFactor,
+      );
+
       for (final imageFile in images) {
         final bytes = await imageFile.readAsBytes();
         final decoded = await ui.instantiateImageCodec(bytes);
         await decoded.getNextFrame();
 
         pdf.addPage(pw.Page(
+          pageFormat: pageFormat,
           build: (_) => pw.Center(
-            child: pw.Image(pw.MemoryImage(bytes), fit: pw.BoxFit.contain),
+            child: pw.Image(
+              pw.MemoryImage(bytes),
+              fit: pw.BoxFit.contain,
+              width: pageFormat.width,
+              height: pageFormat.height,
+            ),
           ),
         ));
       }
-      await widget.document.pdfFile.writeAsBytes(await pdf.save());
+
+      final pdfBytes = await pdf.save();
+      final localFile = widget.document.pdfFile;
+      await localFile.writeAsBytes(pdfBytes);
+
+      final downloadsDir = await StorageService().downloads();
+      final downloadedFile = File(path.join(downloadsDir.path, '${widget.document.name}.pdf'));
+      await downloadedFile.writeAsBytes(pdfBytes);
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved ${widget.document.name}.pdf')),
+          SnackBar(content: Text('Downloaded to ${downloadedFile.path}')),
         );
       }
     } finally {
       if (mounted) setState(() => processing = false);
+    }
+  }
+
+  Future<void> _saveCombinedJpg() async {
+    if (images.isEmpty) return;
+
+    final decodedImages = <ui.Image>[];
+    for (final imageFile in images) {
+      final bytes = await imageFile.readAsBytes();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      decodedImages.add(frame.image);
+    }
+
+    final maxWidth = decodedImages.fold<int>(
+      0,
+      (current, img) => img.width > current ? img.width : current,
+    );
+    final totalHeight = decodedImages.fold<int>(0, (total, img) => total + img.height);
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+    final backgroundPaint = Paint()..color = Colors.white;
+
+    canvas.drawRect(
+      Rect.fromLTWH(0, 0, maxWidth.toDouble(), totalHeight.toDouble()),
+      backgroundPaint,
+    );
+
+    var offsetY = 0.0;
+    for (final image in decodedImages) {
+      final pageWidth = image.width.toDouble();
+      final pageHeight = image.height.toDouble();
+      final targetRect = Rect.fromLTWH(
+        (maxWidth - pageWidth) / 2,
+        offsetY,
+        pageWidth,
+        pageHeight,
+      );
+      canvas.drawImageRect(
+        image,
+        Rect.fromLTWH(0, 0, pageWidth, pageHeight),
+        targetRect,
+        Paint(),
+      );
+      offsetY += pageHeight;
+    }
+
+    final picture = recorder.endRecording();
+    final rendered = await picture.toImage(maxWidth, totalHeight);
+    final pngBytesData = await rendered.toByteData(format: ui.ImageByteFormat.png);
+    if (pngBytesData == null) {
+      throw const FormatException('Unable to encode JPG');
+    }
+
+    final pngBytes = pngBytesData.buffer.asUint8List();
+    final decoded = img.decodePng(pngBytes);
+    if (decoded == null) {
+      throw const FormatException('Unable to decode combined image');
+    }
+
+    final jpegBytes = img.encodeJpg(decoded);
+    final downloadsDir = await StorageService().downloads();
+    final outputFile = File(path.join(downloadsDir.path, '${widget.document.name}.jpg'));
+    await outputFile.writeAsBytes(jpegBytes);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Downloaded JPG to ${outputFile.path}')),
+      );
     }
   }
 
@@ -512,17 +638,29 @@ class _DocumentPageState extends State<DocumentPage> {
           actions: [
             if (images.isNotEmpty)
               PopupMenuButton<String>(
-                tooltip: 'Save PDF size',
+                tooltip: 'Save document',
                 onSelected: (label) async {
-                  final scale = pdfScales[label] ?? 1.0;
+                  if (label == 'jpg') {
+                    await _saveCombinedJpg();
+                    return;
+                  }
+
+                  final scale = DocumentPage.pdfScales[label] ?? 1.0;
                   await _savePdf(scale);
                 },
-                itemBuilder: (context) => pdfScales.entries
-                    .map((entry) => PopupMenuItem<String>(
-                          value: entry.key,
-                          child: Text('${entry.key} - ${entry.key == 'Actual' ? 'Actual size' : entry.key == 'Medium' ? '80% of Actual Size' : entry.key == 'Small' ? '60% of Actual Size' : '50% Actual size'}'),
-                        ))
-                    .toList(),
+                itemBuilder: (context) => [
+                  ...DocumentPage.pdfScales.entries.map(
+                    (entry) => PopupMenuItem<String>(
+                      value: entry.key,
+                      child: Text(DocumentPage.sizeLabel(entry.key, _documentBytes)),
+                    ),
+                  ),
+                  const PopupMenuDivider(),
+                  const PopupMenuItem<String>(
+                    value: 'jpg',
+                    child: Text('Download JPG'),
+                  ),
+                ],
                 icon: const Icon(Icons.save_alt),
               ),
           ],
@@ -668,6 +806,7 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
       for (final image in widget.document.images) {
         final bytes = await image.readAsBytes();
         pdf.addPage(pw.Page(
+          pageFormat: pdf_lib.PdfPageFormat.a4,
           build: (_) => pw.Center(
             child: pw.Image(pw.MemoryImage(bytes), fit: pw.BoxFit.contain),
           ),
@@ -684,9 +823,51 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
     }
   }
 
-  Future<void> _open(BuildContext context) async {
-    if (!await widget.document.pdfFile.exists()) {
+  Future<void> _saveCombinedJpg() async {
+    if (widget.document.images.isEmpty) return;
+
+    final decodedImages = <img.Image>[];
+    for (final imageFile in widget.document.images) {
+      final bytes = await imageFile.readAsBytes();
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) continue;
+      decodedImages.add(decoded);
+    }
+
+    if (decodedImages.isEmpty) return;
+
+    final maxWidth = decodedImages.fold<int>(
+      0,
+      (current, page) => page.width > current ? page.width : current,
+    );
+    final totalHeight = decodedImages.fold<int>(0, (total, page) => total + page.height);
+
+    final combined = img.Image(width: maxWidth, height: totalHeight);
+    var y = 0;
+    for (final page in decodedImages) {
+      final xOffset = (maxWidth - page.width) ~/ 2;
+      img.compositeImage(combined, page, dstX: xOffset, dstY: y);
+      y += page.height;
+    }
+
+    final jpegBytes = img.encodeJpg(combined);
+    final downloadsDir = await StorageService().downloads();
+    final outputFile = File(path.join(downloadsDir.path, '${widget.document.name}.jpg'));
+    await outputFile.writeAsBytes(jpegBytes);
+
+    if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Downloaded JPG to ${outputFile.path}')),
+      );
+    }
+  }
+
+  Future<void> _open(BuildContext context) async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final pdfExists = await widget.document.pdfFile.exists();
+    if (!context.mounted) return;
+    if (!pdfExists) {
+      messenger?.showSnackBar(
         const SnackBar(content: Text('Save the PDF first.')),
       );
       return;
@@ -696,25 +877,40 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: Text('${widget.document.name}')),
+        appBar: AppBar(title: Text(widget.document.name)),
         body: Column(
           children: [
             Expanded(
               child: widget.document.images.isEmpty
                   ? const Center(child: Text('No pictures in this file.'))
-                  : GridView.builder(
+                  : ListView.separated(
                       padding: const EdgeInsets.all(12),
                       itemCount: widget.document.images.length,
-                      gridDelegate:
-                          const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2,
-                        crossAxisSpacing: 8,
-                        mainAxisSpacing: 8,
-                      ),
-                      itemBuilder: (_, index) => Image.file(
-                        widget.document.images[index],
-                        fit: BoxFit.cover,
-                      ),
+                      separatorBuilder: (_, _) => const SizedBox(height: 12),
+                      itemBuilder: (_, index) {
+                        final file = widget.document.images[index];
+                        return Container(
+                          decoration: BoxDecoration(
+                            color: Colors.white,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: Colors.grey.shade300),
+                            boxShadow: [
+                              BoxShadow(
+                                color: Colors.black.withValues(alpha: 0.04),
+                                blurRadius: 8,
+                                offset: const Offset(0, 2),
+                              ),
+                            ],
+                          ),
+                          child: ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: AspectRatio(
+                              aspectRatio: 0.75,
+                              child: Image.file(file, fit: BoxFit.contain),
+                            ),
+                          ),
+                        );
+                      },
                     ),
             ),
             Padding(
@@ -731,12 +927,23 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: () => _open(context),
-                      icon: const Icon(Icons.open_in_new),
-                      label: const Text('Open PDF'),
+                      onPressed: _saveCombinedJpg,
+                      icon: const Icon(Icons.image),
+                      label: const Text('Save JPG'),
                     ),
                   ),
                 ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+              child: SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: () => _open(context),
+                  icon: const Icon(Icons.open_in_new),
+                  label: const Text('Open PDF'),
+                ),
               ),
             ),
           ],
