@@ -36,19 +36,11 @@ void main() {
     expect(sanitizeExportFileName('  My Report  ', 'jpg'), 'My Report');
   });
 
-  test('uses the resized pixel area, not a linear scale, in the menu labels', () {
-    expect(DocumentPage.sizeLabel('Actual', 50 * 1024), 'Actual - 50KB');
-    expect(DocumentPage.sizeLabel('Actual', 1024 * 1024), 'Actual - 1MB');
-    expect(DocumentPage.sizeLabel('Medium', 50 * 1024), 'Medium - 20KB');
-    expect(DocumentPage.sizeLabel('Small', 50 * 1024), 'Small - 6KB');
-    expect(DocumentPage.sizeLabel('Smallest', 50 * 1024), 'Smallest - 1KB');
-  });
-
-  test('selected export size actually reduces the generated JPG file size', () async {
+  test('exports JPG and PDF files successfully without a size selector', () async {
     final tempDir = await Directory.systemTemp.createTemp('scanner_pro_export_test_');
     addTearDown(() async => tempDir.delete(recursive: true));
 
-    final image = img.Image(width: 3000, height: 2000);
+    final image = img.Image(width: 1200, height: 800);
     for (var y = 0; y < image.height; y++) {
       for (var x = 0; x < image.width; x++) {
         image.setPixelRgba(x, y, 120, 140, 180, 255);
@@ -58,66 +50,45 @@ void main() {
     final sourceFile = File('${tempDir.path}/source.jpg');
     await sourceFile.writeAsBytes(img.encodeJpg(image, quality: 100));
 
-    final actualPath = await exportDocumentImagesToDownloads(
+    final jpgPath = await exportDocumentImagesToDownloads(
       images: [sourceFile],
       fileType: 'jpg',
-      fileSizeKey: 'Actual',
-      fileName: 'actual_size',
+      fileName: 'exported_jpg',
     );
-    final smallPath = await exportDocumentImagesToDownloads(
+    final pdfPath = await exportDocumentImagesToDownloads(
       images: [sourceFile],
-      fileType: 'jpg',
-      fileSizeKey: 'Smallest',
-      fileName: 'small_size',
+      fileType: 'pdf',
+      fileName: 'exported_pdf',
     );
 
-    final actualSize = File(actualPath).lengthSync();
-    final smallestSize = File(smallPath).lengthSync();
-
-    expect(actualSize, greaterThan(smallestSize));
-    expect(actualSize - smallestSize, greaterThan(1000));
+    expect(File(jpgPath).existsSync(), isTrue);
+    expect(File(pdfPath).existsSync(), isTrue);
+    expect(File(jpgPath).lengthSync(), greaterThan(0));
+    expect(File(pdfPath).lengthSync(), greaterThan(0));
   });
 
-  test('selected size key reduces both PDF and JPG downloads through the shared export helper', () async {
-    final tempDir = await Directory.systemTemp.createTemp('scanner_pro_export_size_test_');
+  testWidgets('tapping the document name opens the rename dialog', (WidgetTester tester) async {
+    final tempDir = await Directory.systemTemp.createTemp('scanner_pro_rename_test_');
     addTearDown(() async => tempDir.delete(recursive: true));
 
-    final image = img.Image(width: 3000, height: 2000);
+    final documentDir = Directory('${tempDir.path}/Invoice');
+    await documentDir.create(recursive: true);
+    final image = img.Image(width: 1200, height: 800);
     for (var y = 0; y < image.height; y++) {
       for (var x = 0; x < image.width; x++) {
-        image.setPixelRgba(x, y, 120, 140, 180, 255);
+        image.setPixelRgba(x, y, 20, 40, 80, 255);
       }
     }
+    final imageFile = File('${documentDir.path}/1.jpg');
+    await imageFile.writeAsBytes(img.encodeJpg(image, quality: 90));
 
-    final sourceFile = File('${tempDir.path}/source.jpg');
-    await sourceFile.writeAsBytes(img.encodeJpg(image, quality: 100));
+    await tester.pumpWidget(MaterialApp(
+      home: DocumentPage(document: DocumentFolder(documentDir)),
+    ));
 
-    final actualPdf = await exportDocumentImagesToDownloads(
-      images: [sourceFile],
-      fileType: 'pdf',
-      fileSizeKey: 'Actual',
-      fileName: 'actual_pdf',
-    );
-    final smallestPdf = await exportDocumentImagesToDownloads(
-      images: [sourceFile],
-      fileType: 'pdf',
-      fileSizeKey: 'Smallest',
-      fileName: 'smallest_pdf',
-    );
-    final actualJpg = await exportDocumentImagesToDownloads(
-      images: [sourceFile],
-      fileType: 'jpg',
-      fileSizeKey: 'Actual',
-      fileName: 'actual_jpg',
-    );
-    final smallestJpg = await exportDocumentImagesToDownloads(
-      images: [sourceFile],
-      fileType: 'jpg',
-      fileSizeKey: 'Smallest',
-      fileName: 'smallest_jpg',
-    );
+    await tester.tap(find.text('Invoice'));
+    await tester.pumpAndSettle();
 
-    expect(File(actualPdf).lengthSync(), greaterThan(File(smallestPdf).lengthSync()));
-    expect(File(actualJpg).lengthSync(), greaterThan(File(smallestJpg).lengthSync()));
+    expect(find.text('Rename file'), findsOneWidget);
   });
 }

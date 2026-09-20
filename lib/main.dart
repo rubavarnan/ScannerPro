@@ -1,12 +1,10 @@
 import 'dart:io';
-import 'dart:typed_data';
-import 'dart:ui' as ui;
 
 import 'package:cunning_document_scanner/cunning_document_scanner.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
-import 'package:open_file/open_file.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:image_cropper/image_cropper.dart';
@@ -22,14 +20,80 @@ class ScannerProApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-        title: 'Scanner Pro',
-        theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-        home: const HomePage(),
-      );
+    title: 'Scanner Pro',
+    theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+    home: const HomePage(),
+  );
 }
 
 class MyApp extends ScannerProApp {
   const MyApp({super.key});
+}
+
+void showGeneratingDialog(BuildContext context) {
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => const AlertDialog(
+      content: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 24,
+            height: 24,
+            child: CircularProgressIndicator(strokeWidth: 3),
+          ),
+          SizedBox(width: 16),
+          Text('Generating...'),
+        ],
+      ),
+    ),
+  );
+}
+
+void hideGeneratingDialog(BuildContext context) {
+  if (Navigator.of(context).canPop()) {
+    Navigator.of(context).pop();
+  }
+}
+
+Uint8List compressEditedImage(Uint8List bytes, {int quality = 82}) {
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) return bytes;
+  final safeQuality = quality.clamp(1, 100);
+  return Uint8List.fromList(img.encodeJpg(decoded, quality: safeQuality));
+}
+
+img.Image applyBrightnessAndContrast(
+  img.Image source, {
+  int brightness = 0,
+  int contrast = 0,
+}) {
+  final safeBrightness = brightness.clamp(-100, 100);
+  final safeContrast = contrast.clamp(-100, 100);
+  final contrastFactor = safeContrast == 0
+      ? 1.0
+      : (259.0 * (safeContrast + 255.0)) / (255.0 * (259.0 - safeContrast));
+  final brightnessShift = (safeBrightness / 100.0) * 255.0;
+
+  final adjusted = img.Image(width: source.width, height: source.height);
+  for (var y = 0; y < source.height; y++) {
+    for (var x = 0; x < source.width; x++) {
+      final pixel = source.getPixel(x, y);
+      final r = ((pixel.r - 128.0) * contrastFactor + 128.0 + brightnessShift)
+          .round()
+          .clamp(0, 255);
+      final g = ((pixel.g - 128.0) * contrastFactor + 128.0 + brightnessShift)
+          .round()
+          .clamp(0, 255);
+      final b = ((pixel.b - 128.0) * contrastFactor + 128.0 + brightnessShift)
+          .round()
+          .clamp(0, 255);
+      final a = pixel.a;
+      adjusted.setPixelRgba(x, y, r, g, b, a);
+    }
+  }
+  return adjusted;
 }
 
 class DocumentFolder {
@@ -39,19 +103,25 @@ class DocumentFolder {
   String get name => path.basename(directory.path);
   File get pdfFile => File(path.join(directory.path, '$name.pdf'));
 
-  List<File> get images => directory
-      .listSync()
-      .whereType<File>()
-      .where((file) => ['.jpg', '.jpeg', '.png', '.heic']
-          .contains(path.extension(file.path).toLowerCase()))
-      .toList()
-    ..sort((a, b) => a.path.compareTo(b.path));
+  List<File> get images =>
+      directory
+          .listSync()
+          .whereType<File>()
+          .where(
+            (file) => [
+              '.jpg',
+              '.jpeg',
+              '.png',
+              '.heic',
+            ].contains(path.extension(file.path).toLowerCase()),
+          )
+          .toList()
+        ..sort((a, b) => a.path.compareTo(b.path));
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is DocumentFolder &&
-          directory.path == other.directory.path;
+      other is DocumentFolder && directory.path == other.directory.path;
 
   @override
   int get hashCode => directory.path.hashCode;
@@ -70,6 +140,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   int _brightness = 0;
   int _contrast = 0;
   bool _showOriginal = false;
+  bool _isBusy = false;
 
   @override
   void initState() {
@@ -77,11 +148,49 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     _currentFile = widget.file;
   }
 
+  Future<void> _runAction(Future<void> Function() action) async {
+    if (_isBusy || !mounted) return;
+    setState(() => _isBusy = true);
+    try {
+      await action();
+    } finally {
+      if (mounted) {
+        setState(() => _isBusy = false);
+      }
+    }
+  }
+
   Future<File> _persistEditedImage(Uint8List bytes, String suffix) async {
+    final compressed = compressEditedImage(bytes);
     final tempDir = await getTemporaryDirectory();
-    final target = File(path.join(tempDir.path, 'scanner_pro_${DateTime.now().millisecondsSinceEpoch}_$suffix.jpg'));
-    await target.writeAsBytes(bytes);
+    final target = File(
+      path.join(
+        tempDir.path,
+        'scanner_pro_${DateTime.now().millisecondsSinceEpoch}_$suffix.jpg',
+      ),
+    );
+    await target.writeAsBytes(compressed);
     return target;
+  }
+
+  Future<void> _applyEnhancement() async {
+    final source = _showOriginal ? widget.file : _currentFile;
+    final bytes = await source.readAsBytes();
+    final decoded = img.decodeImage(bytes);
+    if (decoded == null) return;
+
+    final enhanced = applyBrightnessAndContrast(
+      decoded,
+      brightness: _brightness,
+      contrast: _contrast,
+    );
+    final output = Uint8List.fromList(img.encodeJpg(enhanced, quality: 100));
+    final updated = await _persistEditedImage(output, 'enhanced');
+    if (!mounted) return;
+    setState(() {
+      _showOriginal = false;
+      _currentFile = updated;
+    });
   }
 
   Future<void> _cropImage() async {
@@ -104,23 +213,14 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     if (cropped == null || !mounted) return;
 
     final nextFile = File(cropped.path);
-    setState(() => _currentFile = nextFile);
+    setState(() {
+      _showOriginal = false;
+      _currentFile = nextFile;
+    });
   }
 
   Future<void> _enhanceImage() async {
-    final bytes = await _currentFile.readAsBytes();
-    final decoded = img.decodeImage(bytes);
-    if (decoded == null) return;
-
-    final enhanced = img.adjustColor(
-      decoded,
-      brightness: _brightness,
-      contrast: _contrast,
-      saturation: 15,
-    );
-    final output = Uint8List.fromList(img.encodeJpg(enhanced));
-    final updated = await _persistEditedImage(output, 'enhanced');
-    if (mounted) setState(() => _currentFile = updated);
+    await _applyEnhancement();
   }
 
   Future<void> _rotateImage() async {
@@ -131,22 +231,28 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     final rotated = img.copyRotate(decoded, angle: 90);
     final output = Uint8List.fromList(img.encodeJpg(rotated));
     final updated = await _persistEditedImage(output, 'rotated');
-    if (mounted) setState(() => _currentFile = updated);
+    if (mounted) {
+      setState(() {
+        _showOriginal = false;
+        _currentFile = updated;
+      });
+    }
   }
 
   Future<void> _resetImage() async {
     setState(() {
       _brightness = 0;
       _contrast = 0;
+      _showOriginal = false;
       _currentFile = widget.file;
     });
   }
 
   Future<void> _saveImage() async {
     final updatedBytes = await _currentFile.readAsBytes();
-    await widget.file.writeAsBytes(updatedBytes);
+    final savedFile = await _persistEditedImage(updatedBytes, 'saved');
     if (!mounted) return;
-    Navigator.pop(context, widget.file);
+    Navigator.pop(context, savedFile);
   }
 
   @override
@@ -178,34 +284,34 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
               child: Row(
                 children: [
                   Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _cropImage,
-                      icon: const Icon(Icons.crop),
-                      label: const Text('Crop'),
+                    child: FilledButton(
+                      onPressed: _isBusy ? null : () => _runAction(_cropImage),
+                      child: const Icon(Icons.crop),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _rotateImage,
-                      icon: const Icon(Icons.rotate_90_degrees_ccw),
-                      label: const Text('Rotate'),
+                    child: FilledButton(
+                      onPressed: _isBusy
+                          ? null
+                          : () => _runAction(_rotateImage),
+                      child: const Icon(Icons.rotate_90_degrees_ccw),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _enhanceImage,
-                      icon: const Icon(Icons.auto_fix_high),
-                      label: const Text('Enhance'),
+                    child: FilledButton(
+                      onPressed: _isBusy
+                          ? null
+                          : () => _runAction(_enhanceImage),
+                      child: const Icon(Icons.auto_fix_high),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _resetImage,
-                      icon: const Icon(Icons.restart_alt),
-                      label: const Text('Reset'),
+                    child: FilledButton(
+                      onPressed: _isBusy ? null : () => _runAction(_resetImage),
+                      child: const Icon(Icons.restart_alt),
                     ),
                   ),
                 ],
@@ -219,7 +325,8 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                   ButtonSegment(value: true, label: Text('Original')),
                 ],
                 selected: {_showOriginal},
-                onSelectionChanged: (selection) => setState(() => _showOriginal = selection.first),
+                onSelectionChanged: (selection) =>
+                    setState(() => _showOriginal = selection.first),
               ),
             ),
             Expanded(
@@ -250,7 +357,13 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                           min: -50,
                           max: 50,
                           divisions: 100,
-                          onChanged: (value) => setState(() => _brightness = value.round()),
+                          onChanged: (value) {
+                            setState(() => _brightness = value.round());
+                          },
+                          onChangeEnd: (_) async {
+                            if (_showOriginal || _isBusy || !mounted) return;
+                            await _runAction(_applyEnhancement);
+                          },
                         ),
                       ),
                     ],
@@ -264,7 +377,13 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                           min: -50,
                           max: 50,
                           divisions: 100,
-                          onChanged: (value) => setState(() => _contrast = value.round()),
+                          onChanged: (value) {
+                            setState(() => _contrast = value.round());
+                          },
+                          onChangeEnd: (_) async {
+                            if (_showOriginal || _isBusy || !mounted) return;
+                            await _runAction(_applyEnhancement);
+                          },
                         ),
                       ),
                     ],
@@ -292,18 +411,27 @@ class StorageService {
     }
 
     if (operatingSystem == 'windows') {
-      final home = homeDirectory ?? Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'] ?? '.';
+      final home =
+          homeDirectory ??
+          Platform.environment['USERPROFILE'] ??
+          Platform.environment['HOME'] ??
+          '.';
       return Directory(path.join(home, 'Downloads'));
     }
 
-    final home = homeDirectory ?? Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '.';
+    final home =
+        homeDirectory ??
+        Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        '.';
     return Directory(path.join(home, 'Downloads'));
   }
 
   Future<Directory> root() async {
     if (Platform.isAndroid) {
       final permission = await Permission.manageExternalStorage.status;
-      if (!permission.isGranted) await Permission.manageExternalStorage.request();
+      if (!permission.isGranted)
+        await Permission.manageExternalStorage.request();
     }
     final root = Platform.isAndroid
         ? Directory('/storage/emulated/0/Documents/Scanner Pro')
@@ -314,18 +442,19 @@ class StorageService {
 
   Future<Directory> downloads() async {
     if (Platform.isAndroid) {
-      final downloads = await getDownloadsDirectory();
-      final dir = downloads ??
-          standardDownloadsDirectory(
-            operatingSystem: 'android',
-            downloadsDirectoryPath: '/storage/emulated/0/Download',
-          );
+      final dir = standardDownloadsDirectory(
+        operatingSystem: 'android',
+        downloadsDirectoryPath: '/storage/emulated/0/Download',
+      );
       await dir.create(recursive: true);
       return dir;
     }
 
     if (Platform.isWindows) {
-      final home = Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'] ?? '.';
+      final home =
+          Platform.environment['USERPROFILE'] ??
+          Platform.environment['HOME'] ??
+          '.';
       final dir = standardDownloadsDirectory(
         operatingSystem: 'windows',
         homeDirectory: home,
@@ -334,7 +463,10 @@ class StorageService {
       return dir;
     }
 
-    final home = Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '.';
+    final home =
+        Platform.environment['HOME'] ??
+        Platform.environment['USERPROFILE'] ??
+        '.';
     final dir = standardDownloadsDirectory(
       operatingSystem: 'linux',
       homeDirectory: home,
@@ -349,11 +481,12 @@ class StorageService {
         .listSync()
         .whereType<Directory>()
         .map(DocumentFolder.new)
-        .where((document) =>
-            document.images.isNotEmpty || document.pdfFile.existsSync())
+        .where(
+          (document) =>
+              document.images.isNotEmpty || document.pdfFile.existsSync(),
+        )
         .toList()
-      ..sort((a, b) =>
-          a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
   }
 
   Future<DocumentFolder> createDocument() async {
@@ -398,8 +531,6 @@ class _HomePageState extends State<HomePage> {
         .where((document) => document.name.toLowerCase().contains(query))
         .toList();
   }
-
-  int get _selectedDocumentsBytes => documentTotalBytes(_selectedDocuments.toList());
 
   bool get _isMultiSelectMode => _selectedDocuments.isNotEmpty;
 
@@ -480,7 +611,9 @@ class _HomePageState extends State<HomePage> {
     );
     final clean = value?.trim().replaceAll(RegExp(r'[<>:"/\\|?*]'), '-');
     if (clean == null || clean.isEmpty || clean == document.name) return;
-    final destination = Directory(path.join(document.directory.parent.path, clean));
+    final destination = Directory(
+      path.join(document.directory.parent.path, clean),
+    );
     if (await destination.exists()) {
       _message('A file with that name already exists.');
       return;
@@ -494,7 +627,9 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Delete document?'),
-        content: Text('This will delete "${document.name}" and all its scanned files.'),
+        content: Text(
+          'This will delete "${document.name}" and all its scanned files.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
@@ -524,7 +659,9 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         title: const Text('Delete selected documents?'),
-        content: Text('This will delete ${_selectedDocuments.length} selected document(s):\n$titles'),
+        content: Text(
+          'This will delete ${_selectedDocuments.length} selected document(s):\n$titles',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext, false),
@@ -554,14 +691,13 @@ class _HomePageState extends State<HomePage> {
     if (_selectedDocuments.isEmpty) return;
 
     String fileType = 'pdf';
-    String fileSizeKey = 'Actual';
+    String fileSize = 'Actual';
 
     final result = await showDialog<Map<String, String>>(
       context: context,
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
-            final estimatedSizeValue = DocumentPage.sizeLabel(fileSizeKey, _selectedDocumentsBytes).split(' - ').last;
             return AlertDialog(
               title: const Text('Share selected files'),
               content: SizedBox(
@@ -576,30 +712,23 @@ class _HomePageState extends State<HomePage> {
                         DropdownMenuItem(value: 'pdf', child: Text('pdf')),
                         DropdownMenuItem(value: 'jpg', child: Text('jpg')),
                       ],
-                      onChanged: (value) => setDialogState(() => fileType = value ?? fileType),
+                      onChanged: (value) {
+                        final nextType = value ?? fileType;
+                        if (nextType == fileType) return;
+                        setDialogState(() => fileType = nextType);
+                      },
                     ),
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
-                      initialValue: fileSizeKey,
-                      decoration: const InputDecoration(labelText: 'File size'),
-                      items: DocumentPage.pdfScales.keys.map(
-                        (key) => DropdownMenuItem(
-                          value: key,
-                          child: Text(DocumentPage.sizeLabel(key, _selectedDocumentsBytes)),
-                        ),
-                      ).toList(),
-                      onChanged: (value) => setDialogState(() => fileSizeKey = value ?? fileSizeKey),
-                    ),
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        'Estimated total size: $estimatedSizeValue',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: Theme.of(context).colorScheme.primary,
-                          fontWeight: FontWeight.w600,
+                      initialValue: fileSize,
+                      decoration: const InputDecoration(labelText: 'File Size'),
+                      items: buildExportSizeItems(
+                        documentTotalBytes(
+                          _selectedDocuments.toList(),
                         ),
                       ),
+                      onChanged: (value) =>
+                          setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
                   ],
                 ),
@@ -610,10 +739,11 @@ class _HomePageState extends State<HomePage> {
                   child: const Text('Cancel'),
                 ),
                 FilledButton(
-                  onPressed: () => Navigator.pop(dialogContext, {
-                    'fileType': fileType,
-                    'size': fileSizeKey,
-                  }),
+                  onPressed: () =>
+                      Navigator.pop(dialogContext, {
+                        'fileType': fileType,
+                        'fileSize': fileSize,
+                      }),
                   child: const Text('Share'),
                 ),
               ],
@@ -626,6 +756,7 @@ class _HomePageState extends State<HomePage> {
     if (result == null) return;
 
     setState(() => _bulkProcessing = true);
+    showGeneratingDialog(context);
     try {
       final exportedFiles = <XFile>[];
       for (final document in _selectedDocuments) {
@@ -633,21 +764,24 @@ class _HomePageState extends State<HomePage> {
         final exportPath = await exportDocumentImagesToDownloads(
           images: document.images,
           fileType: result['fileType'] ?? 'pdf',
-          fileSizeKey: result['size'] ?? 'Actual',
+          fileSize: result['fileSize'] ?? 'Actual',
           fileName: document.name,
         );
         exportedFiles.add(XFile(exportPath));
       }
 
       if (exportedFiles.isEmpty) {
+        hideGeneratingDialog(context);
         _message('No documents were available to share.');
         return;
       }
 
+      hideGeneratingDialog(context);
       if (!mounted) return;
       await Share.shareXFiles(exportedFiles, text: 'Shared from Scanner Pro');
       _clearSelection();
     } catch (error) {
+      if (mounted) hideGeneratingDialog(context);
       if (!mounted) return;
       _message('Export failed: $error');
     } finally {
@@ -710,150 +844,170 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-          title: _searchOpen
-              ? SizedBox(
-                  width: 220,
-                  child: TextField(
-                    controller: _searchController,
-                    autofocus: true,
-                    onChanged: (value) {
-                      setState(() => _searchQuery = value);
-                    },
-                    decoration: const InputDecoration(
-                      hintText: 'Search docs',
-                      border: InputBorder.none,
-                      isDense: true,
-                      contentPadding: EdgeInsets.zero,
-                    ),
-                  ),
-                )
-              : _isMultiSelectMode
-                  ? Text('${_selectedDocuments.length} selected')
-                  : Text('My Docs (${documents.length})'),
-          leading: _isMultiSelectMode
-              ? IconButton(
-                  onPressed: _clearSelection,
-                  icon: const Icon(Icons.close),
-                  tooltip: 'Clear selection',
-                )
-              : null,
-          actions: [
-            if (!_isMultiSelectMode)
-              IconButton(
-                onPressed: _toggleSearch,
-                icon: Icon(_searchOpen ? Icons.close : Icons.search),
-                tooltip: 'Search documents',
-              ),
-          ],
-        ),
-        floatingActionButton: _isMultiSelectMode
-            ? null
-            : FloatingActionButton.extended(
-                onPressed: _newDocument,
-                icon: const Icon(Icons.add),
-                label: const Text('New file'),
-              ),
-        body: Stack(
-          children: [
-            RefreshIndicator(
-              onRefresh: _refresh,
-              child: loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _filteredDocuments.isEmpty
-                      ? ListView(
-                          children: [
-                            const SizedBox(height: 220),
-                            Center(
-                              child: Text(
-                                _searchQuery.isEmpty
-                                    ? 'No files yet. Tap New file to start scanning.'
-                                    : 'No documents match "$_searchQuery".',
-                              ),
-                            ),
-                          ],
-                        )
-                      : ListView.separated(
-                          padding: EdgeInsets.fromLTRB(16, 16, 16, _isMultiSelectMode ? 120 : 100),
-                          itemCount: _filteredDocuments.length,
-                          separatorBuilder: (_, _) => const SizedBox(height: 8),
-                          itemBuilder: (context, index) {
-                            final document = _filteredDocuments[index];
-                            final selected = _selectedDocuments.contains(document);
-                            return ListTile(
-                              tileColor: Theme.of(context)
-                                  .colorScheme
-                                  .surfaceContainerHighest,
-                              shape: RoundedRectangleBorder(
-                                borderRadius: BorderRadius.circular(12),
-                              ),
-                              leading: _isMultiSelectMode
-                                  ? Checkbox(
-                                      value: selected,
-                                      onChanged: (_) => _toggleDocumentSelection(document),
-                                    )
-                                  : const Icon(Icons.folder_outlined),
-                              title: Text(
-                                document.name,
-                                style: const TextStyle(fontWeight: FontWeight.w600),
-                              ),
-                              subtitle: Text(
-                                  '${document.images.length} picture${document.images.length == 1 ? '' : 's'}'),
-                              onTap: _isMultiSelectMode
-                                  ? () => _toggleDocumentSelection(document)
-                                  : () => _openDocument(document),
-                              onLongPress: () => _toggleDocumentSelection(document),
-                              trailing: _isMultiSelectMode
-                                  ? null
-                                  : IconButton(
-                                      icon: const Icon(Icons.more_vert),
-                                      onPressed: () => _menu(document),
-                                    ),
-                            );
-                          },
-                        ),
-            ),
-            if (_isMultiSelectMode)
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: SafeArea(
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.surface,
-                      border: Border(
-                        top: BorderSide(
-                          color: Theme.of(context).dividerColor,
-                        ),
-                      ),
-                    ),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: FilledButton.icon(
-                            onPressed: _bulkProcessing ? null : _deleteSelectedDocuments,
-                            icon: const Icon(Icons.delete_outline),
-                            label: const Text('Delete'),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: FilledButton.icon(
-                            onPressed: _bulkProcessing ? null : _shareSelectedDocuments,
-                            icon: const Icon(Icons.share),
-                            label: const Text('Share'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+    appBar: AppBar(
+      title: _searchOpen
+          ? SizedBox(
+              width: 220,
+              child: TextField(
+                controller: _searchController,
+                autofocus: true,
+                onChanged: (value) {
+                  setState(() => _searchQuery = value);
+                },
+                decoration: const InputDecoration(
+                  hintText: 'Search docs',
+                  border: InputBorder.none,
+                  isDense: true,
+                  contentPadding: EdgeInsets.zero,
                 ),
               ),
-          ],
+            )
+          : _isMultiSelectMode
+          ? Text('${_selectedDocuments.length} selected')
+          : Text('My Docs (${documents.length})'),
+      leading: _isMultiSelectMode
+          ? IconButton(
+              onPressed: _clearSelection,
+              icon: const Icon(Icons.close),
+              tooltip: 'Clear selection',
+            )
+          : null,
+      actions: [
+        if (!_isMultiSelectMode)
+          IconButton(
+            onPressed: _toggleSearch,
+            icon: Icon(_searchOpen ? Icons.close : Icons.search),
+            tooltip: 'Search documents',
+          ),
+      ],
+    ),
+    floatingActionButton: _isMultiSelectMode
+        ? null
+        : FloatingActionButton.extended(
+            onPressed: _newDocument,
+            icon: const Icon(Icons.add),
+            label: const Text('New file'),
+          ),
+    body: Stack(
+      children: [
+        RefreshIndicator(
+          onRefresh: _refresh,
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : _filteredDocuments.isEmpty
+              ? ListView(
+                  children: [
+                    const SizedBox(height: 220),
+                    Center(
+                      child: Text(
+                        _searchQuery.isEmpty
+                            ? 'No files yet. Tap New file to start scanning.'
+                            : 'No documents match "$_searchQuery".',
+                      ),
+                    ),
+                  ],
+                )
+              : ListView.separated(
+                  padding: EdgeInsets.fromLTRB(
+                    16,
+                    16,
+                    16,
+                    _isMultiSelectMode ? 120 : 100,
+                  ),
+                  itemCount: _filteredDocuments.length,
+                  separatorBuilder: (_, _) => const SizedBox(height: 8),
+                  itemBuilder: (context, index) {
+                    final document = _filteredDocuments[index];
+                    final selected = _selectedDocuments.contains(document);
+                    final firstImage = document.images.firstOrNull;
+                    return ListTile(
+                      tileColor: Theme.of(
+                        context,
+                      ).colorScheme.surfaceContainerHighest,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      leading: _isMultiSelectMode
+                          ? Checkbox(
+                              value: selected,
+                              onChanged: (_) =>
+                                  _toggleDocumentSelection(document),
+                            )
+                          : firstImage == null
+                          ? const Icon(Icons.folder_outlined)
+                          : ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: Image.file(
+                                firstImage,
+                                width: 48,
+                                height: 48,
+                                fit: BoxFit.cover,
+                              ),
+                            ),
+                      title: Text(
+                        document.name,
+                        style: const TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      subtitle: Text(
+                        '${document.images.length} picture${document.images.length == 1 ? '' : 's'}',
+                      ),
+                      onTap: _isMultiSelectMode
+                          ? () => _toggleDocumentSelection(document)
+                          : () => _openDocument(document),
+                      onLongPress: () => _toggleDocumentSelection(document),
+                      trailing: _isMultiSelectMode
+                          ? null
+                          : IconButton(
+                              icon: const Icon(Icons.more_vert),
+                              onPressed: () => _menu(document),
+                            ),
+                    );
+                  },
+                ),
         ),
-      );
+        if (_isMultiSelectMode)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: SafeArea(
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surface,
+                  border: Border(
+                    top: BorderSide(color: Theme.of(context).dividerColor),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _bulkProcessing
+                            ? null
+                            : _deleteSelectedDocuments,
+                        icon: const Icon(Icons.delete_outline),
+                        label: const Text('Delete'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _bulkProcessing
+                            ? null
+                            : _shareSelectedDocuments,
+                        icon: const Icon(Icons.share),
+                        label: const Text('Share'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    ),
+  );
 }
 
 String sanitizeExportFileName(String rawName, String extension) {
@@ -863,37 +1017,63 @@ String sanitizeExportFileName(String rawName, String extension) {
   final lowerName = normalized.toLowerCase();
   final hasExtension = lowerName.endsWith('.$lowerExtension');
   if (hasExtension) {
-    return normalized.substring(0, normalized.length - lowerExtension.length - 1);
+    return normalized.substring(
+      0,
+      normalized.length - lowerExtension.length - 1,
+    );
   }
   return normalized;
 }
 
 int documentTotalBytes(List<DocumentFolder> documents) {
   return documents.fold<int>(0, (sum, document) {
-    return sum + document.images.fold<int>(0, (docSum, file) => docSum + file.lengthSync());
+    return sum +
+        document.images.fold<int>(
+          0,
+          (docSum, file) => docSum + file.lengthSync(),
+        );
   });
 }
 
-Future<String> exportDocumentImagesToDownloads({
+const exportSizeOptions = <String, double>{
+  'Actual': 0.50,
+  'Medium': 0.40,
+  'Small': 0.35,
+  'Smallest': 0.30,
+};
+
+double exportScaleForSize(String fileSize) =>
+    exportSizeOptions[fileSize] ?? exportSizeOptions['Actual']!;
+
+String formatByteSize(int bytes) {
+  if (bytes < 1024) return '${bytes}B';
+  if (bytes < 1024 * 1024) {
+    return '${(bytes / 1024).toStringAsFixed(0)}KB';
+  }
+  return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
+}
+
+List<DropdownMenuItem<String>> buildExportSizeItems(int actualBytes) =>
+    exportSizeOptions.entries
+        .map(
+          (entry) => DropdownMenuItem(
+            value: entry.key,
+            child: Text(
+              '${entry.key}',
+            ),
+          ),
+        )
+        .toList();
+
+Future<File> _generateExportFile({
   required List<File> images,
   required String fileType,
-  required String fileSizeKey,
-  required String fileName,
+  required File outputFile,
+  required double scaleFactor,
+  required int quality,
 }) async {
-  final scaleFactor = DocumentPage.pdfScales[fileSizeKey] ?? 1.0;
-  final jpegQuality = DocumentPage.qualityFor(fileSizeKey);
   if (images.isEmpty) {
     throw const FormatException('No images available for export');
-  }
-
-  final downloadsDir = await StorageService().downloads();
-  final extension = fileType.toLowerCase() == 'jpg' ? 'jpg' : 'pdf';
-  final cleanName = sanitizeExportFileName(fileName, extension);
-  var outputFile = File(path.join(downloadsDir.path, '$cleanName.$extension'));
-  var suffix = 1;
-  while (await outputFile.exists()) {
-    outputFile = File(path.join(downloadsDir.path, '${cleanName}_$suffix.$extension'));
-    suffix++;
   }
 
   if (fileType.toLowerCase() == 'jpg') {
@@ -902,13 +1082,7 @@ Future<String> exportDocumentImagesToDownloads({
       final bytes = await imageFile.readAsBytes();
       final decoded = img.decodeImage(bytes);
       if (decoded == null) continue;
-
-      final scaled = img.copyResize(
-        decoded,
-        width: (decoded.width * scaleFactor).round(),
-        height: (decoded.height * scaleFactor).round(),
-      );
-      decodedImages.add(scaled);
+      decodedImages.add(_scaleExportImage(decoded, scaleFactor));
     }
 
     if (decodedImages.isEmpty) {
@@ -932,28 +1106,22 @@ Future<String> exportDocumentImagesToDownloads({
       y += page.height;
     }
 
-    await outputFile.writeAsBytes(img.encodeJpg(combined, quality: jpegQuality));
-    return outputFile.path;
+    await outputFile.writeAsBytes(img.encodeJpg(combined, quality: quality));
+    return outputFile;
   }
 
   final pdf = pw.Document();
-  final pageFormat = pdf_lib.PdfPageFormat.standard.copyWith(
-    width: pdf_lib.PdfPageFormat.standard.width * scaleFactor,
-    height: pdf_lib.PdfPageFormat.standard.height * scaleFactor,
-  );
+  final pageFormat = pdf_lib.PdfPageFormat.standard;
 
   for (final imageFile in images) {
     final bytes = await imageFile.readAsBytes();
     final decoded = img.decodeImage(bytes);
     if (decoded == null) continue;
 
-    final scaled = img.copyResize(
-      decoded,
-      width: (decoded.width * scaleFactor).round(),
-      height: (decoded.height * scaleFactor).round(),
+    final scaledImage = _scaleExportImage(decoded, scaleFactor);
+    final scaledBytes = Uint8List.fromList(
+      img.encodeJpg(scaledImage, quality: quality),
     );
-
-    final scaledBytes = Uint8List.fromList(img.encodeJpg(scaled, quality: jpegQuality));
     pdf.addPage(
       pw.Page(
         pageFormat: pageFormat,
@@ -970,48 +1138,109 @@ Future<String> exportDocumentImagesToDownloads({
   }
 
   await outputFile.writeAsBytes(await pdf.save());
+  return outputFile;
+}
+
+img.Image _scaleExportImage(img.Image source, double scaleFactor) {
+  if (scaleFactor >= 1) return source;
+  return img.copyResize(
+    source,
+    width: (source.width * scaleFactor).round().clamp(1, source.width),
+    height: (source.height * scaleFactor).round().clamp(1, source.height),
+  );
+}
+
+Future<String> saveToPublicDownloads({
+  required String fileName,
+  required Uint8List bytes,
+  required String mimeType,
+}) async {
+  if (Platform.isAndroid) {
+    const channel = MethodChannel('scanner_pro/downloads');
+    try {
+      final savedPath = await channel.invokeMethod<String>('saveFile', {
+        'fileName': fileName,
+        'mimeType': mimeType,
+        'bytes': bytes,
+      });
+      if (savedPath != null && savedPath.isNotEmpty) {
+        return savedPath;
+      }
+    } catch (_) {
+      // Fall back to the public Downloads directory if the platform channel fails.
+    }
+  }
+
+  final downloadsDir = await StorageService().downloads();
+  final outputFile = _nextAvailableExportFile(downloadsDir, fileName);
+  await outputFile.parent.create(recursive: true);
+  await outputFile.writeAsBytes(bytes);
   return outputFile.path;
+}
+
+File _nextAvailableExportFile(Directory directory, String fileName) {
+  final extension = path.extension(fileName);
+  final baseName = extension.isEmpty
+      ? fileName
+      : fileName.substring(0, fileName.length - extension.length);
+  var candidate = File(path.join(directory.path, fileName));
+  var suffix = 1;
+  while (candidate.existsSync()) {
+    candidate = File(path.join(directory.path, '$baseName\_$suffix$extension'));
+    suffix++;
+  }
+  return candidate;
+}
+
+Future<String> exportDocumentImagesToDownloads({
+  required List<File> images,
+  required String fileType,
+  required String fileName,
+  String fileSize = 'Actual',
+}) async {
+  final extension = fileType.toLowerCase() == 'jpg' ? 'jpg' : 'pdf';
+  final cleanName = sanitizeExportFileName(fileName, extension);
+  final fileNameWithExtension = '$cleanName.$extension';
+
+  final tempFile = File(
+    path.join(
+      Directory.systemTemp.path,
+      'scanner_pro_${DateTime.now().millisecondsSinceEpoch}_$fileNameWithExtension',
+    ),
+  );
+  await tempFile.parent.create(recursive: true);
+
+  if (images.isEmpty) {
+    throw const FormatException('No images available for export');
+  }
+  await _generateExportFile(
+    images: images,
+    fileType: fileType,
+    outputFile: tempFile,
+    scaleFactor: exportScaleForSize(fileSize),
+    quality: 100,
+  );
+
+  final bytes = await tempFile.readAsBytes();
+  final mimeType = extension == 'jpg' ? 'image/jpeg' : 'application/pdf';
+
+  final targetName = fileNameWithExtension;
+  final publicPath = await saveToPublicDownloads(
+    fileName: targetName,
+    bytes: bytes,
+    mimeType: mimeType,
+  );
+
+  if (await tempFile.exists()) {
+    await tempFile.delete();
+  }
+
+  return publicPath;
 }
 
 class DocumentPage extends StatefulWidget {
   final DocumentFolder document;
   const DocumentPage({required this.document, super.key});
-
-  static const Map<String, double> pdfScales = {
-    'Actual': 1.0,
-    'Medium': 0.72,
-    'Small': 0.46,
-    'Smallest': 0.28,
-  };
-
-  static const Map<String, int> jpgQualities = {
-    'Actual': 100,
-    'Medium': 78,
-    'Small': 58,
-    'Smallest': 36,
-  };
-
-  static int qualityFor(String key) => jpgQualities[key] ?? 100;
-
-  static double effectiveScale(String key) {
-    final baseScale = pdfScales[key] ?? 1.0;
-    final qualityFactor = jpgQualities[key] ?? 100;
-    // PDF export resizes both dimensions of the image, so the effective data
-    // reduction is proportional to the area change, not just the width scale.
-    return (baseScale * baseScale) * (qualityFactor / 100);
-  }
-
-  static String _formatBytesLabel(int bytes) {
-    if (bytes < 1024) return '${bytes}B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).round()}KB';
-    final megabytes = bytes / (1024 * 1024);
-    return '${megabytes.round()}MB';
-  }
-
-  static String sizeLabel(String key, int totalBytes) {
-    final scaledBytes = (totalBytes * effectiveScale(key)).round();
-    return '$key - ${_formatBytesLabel(scaledBytes)}';
-  }
 
   @override
   State<DocumentPage> createState() => _DocumentPageState();
@@ -1019,9 +1248,8 @@ class DocumentPage extends StatefulWidget {
 
 class _DocumentPageState extends State<DocumentPage> {
   bool processing = false;
+  bool saving = false;
   late String _currentName;
-
-  int get _documentBytes => images.fold<int>(0, (sum, file) => sum + file.lengthSync());
 
   List<File> get images => widget.document.images;
 
@@ -1031,20 +1259,22 @@ class _DocumentPageState extends State<DocumentPage> {
     _currentName = widget.document.name;
   }
 
-  Future<Uint8List> _scaledImageBytes(File imageFile, double scaleFactor) async {
-    final bytes = await imageFile.readAsBytes();
-    final decoded = img.decodeImage(bytes);
-    if (decoded == null) return Uint8List.fromList(bytes);
-
-    final width = (decoded.width * scaleFactor).round();
-    final height = (decoded.height * scaleFactor).round();
-    final scaled = img.copyResize(decoded, width: width, height: height);
-    return Uint8List.fromList(img.encodeJpg(scaled));
-  }
-
   String _formatDate(File file) {
     final date = file.lastModifiedSync();
-    const months = <String>['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const months = <String>[
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
     return '${months[date.month - 1]}-${date.day}';
   }
 
@@ -1068,22 +1298,32 @@ class _DocumentPageState extends State<DocumentPage> {
 
       if (scannedPaths == null || scannedPaths.isEmpty) return;
 
-      var nextIndex = images.length + 1;
+      var nextIndex = 1;
+      final existingNames = images.map((file) => path.basenameWithoutExtension(file.path)).toSet();
+      while (existingNames.contains('$nextIndex')) {
+        nextIndex++;
+      }
       for (final scannedPath in scannedPaths) {
         final scannedFile = File(scannedPath);
         if (!await scannedFile.exists()) continue;
 
-        final target = File(path.join(widget.document.directory.path, '${nextIndex++}.jpg'));
+        final target = File(
+          path.join(widget.document.directory.path, '${nextIndex++}.jpg'),
+        );
         await scannedFile.copy(target.path);
+        existingNames.add(path.basenameWithoutExtension(target.path));
+        while (existingNames.contains('$nextIndex')) {
+          nextIndex++;
+        }
       }
 
       await CunningDocumentScanner.cleanCache();
       if (mounted) setState(() {});
     } on CunningDocumentScannerException catch (error) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(error.message)),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
       }
     }
   }
@@ -1104,12 +1344,9 @@ class _DocumentPageState extends State<DocumentPage> {
   }
 
   Future<void> _remove(File file) async {
+    if (!await file.exists()) return;
+
     await file.delete();
-    final files = images;
-    for (var index = 0; index < files.length; index++) {
-      final target = File(path.join(widget.document.directory.path, '${index + 1}.jpg'));
-      if (files[index].path != target.path) await files[index].rename(target.path);
-    }
     if (mounted) setState(() {});
   }
 
@@ -1127,7 +1364,7 @@ class _DocumentPageState extends State<DocumentPage> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(dialogContext, controller.text),
-            child: const Text('Rename'),
+            child: const Text('Save'),
           ),
         ],
       ),
@@ -1135,11 +1372,15 @@ class _DocumentPageState extends State<DocumentPage> {
     final rawName = value?.trim().replaceAll(RegExp(r'[<>:"/\\|?*]'), '-');
     if (rawName == null || rawName.isEmpty || rawName == _currentName) return;
     final clean = rawName;
-    final destination = Directory(path.join(widget.document.directory.parent.path, clean));
+    final destination = Directory(
+      path.join(widget.document.directory.parent.path, clean),
+    );
     if (await destination.exists()) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('A file with that name already exists.')),
+          const SnackBar(
+            content: Text('A file with that name already exists.'),
+          ),
         );
       }
       return;
@@ -1148,40 +1389,21 @@ class _DocumentPageState extends State<DocumentPage> {
     widget.document.directory = destination;
     if (!mounted) return;
     setState(() => _currentName = clean);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Renamed to $clean')),
-    );
-  }
-
-  Future<File> _nextAvailableExportFile(String directoryPath, String baseName, String extension) async {
-    final cleanName = sanitizeExportFileName(baseName, extension);
-    var outputFile = File(path.join(directoryPath, '$cleanName.$extension'));
-    var suffix = 1;
-    while (await outputFile.exists()) {
-      outputFile = File(path.join(directoryPath, '${cleanName}_$suffix.$extension'));
-      suffix++;
-    }
-    return outputFile;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Renamed to $clean')));
   }
 
   Future<String> _exportDocumentFile({
     required String fileType,
-    required String fileSizeKey,
     required String fileName,
+    required String fileSize,
   }) async {
-    final downloadsDir = await StorageService().downloads();
-    final extension = fileType.toLowerCase() == 'jpg' ? 'jpg' : 'pdf';
-    final outputFile = await _nextAvailableExportFile(
-      downloadsDir.path,
-      fileName,
-      extension,
-    );
-
     return exportDocumentImagesToDownloads(
       images: images,
       fileType: fileType,
-      fileSizeKey: fileSizeKey,
       fileName: fileName,
+      fileSize: fileSize,
     );
   }
 
@@ -1189,7 +1411,7 @@ class _DocumentPageState extends State<DocumentPage> {
     if (images.isEmpty) return;
 
     String fileType = 'pdf';
-    String fileSizeKey = 'Actual';
+    String fileSize = 'Actual';
     final fileNameController = TextEditingController(text: _currentName);
 
     final result = await showDialog<Map<String, String>>(
@@ -1197,8 +1419,6 @@ class _DocumentPageState extends State<DocumentPage> {
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
-            final estimatedSizeValue = DocumentPage.sizeLabel(fileSizeKey, _documentBytes).split(' - ').last;
-
             return AlertDialog(
               title: const Text('Share as'),
               content: SizedBox(
@@ -1213,30 +1433,21 @@ class _DocumentPageState extends State<DocumentPage> {
                         DropdownMenuItem(value: 'pdf', child: Text('pdf')),
                         DropdownMenuItem(value: 'jpg', child: Text('jpg')),
                       ],
-                      onChanged: (value) => setDialogState(() => fileType = value ?? fileType),
+                      onChanged: (value) {
+                        final nextType = value ?? fileType;
+                        if (nextType == fileType) return;
+                        setDialogState(() => fileType = nextType);
+                      },
                     ),
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
-                      initialValue: fileSizeKey,
-                      decoration: const InputDecoration(labelText: 'File size'),
-                      items: DocumentPage.pdfScales.keys.map(
-                        (key) => DropdownMenuItem(
-                          value: key,
-                          child: Text(DocumentPage.sizeLabel(key, _documentBytes)),
-                        ),
-                      ).toList(),
-                      onChanged: (value) => setDialogState(() => fileSizeKey = value ?? fileSizeKey),
-                    ),
-                    const SizedBox(height: 12),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        'Estimated size: $estimatedSizeValue',
-                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: Theme.of(context).colorScheme.primary,
-                          fontWeight: FontWeight.w600,
-                        ),
+                      initialValue: fileSize,
+                      decoration: const InputDecoration(labelText: 'File Size'),
+                      items: buildExportSizeItems(
+                        documentTotalBytes([widget.document]),
                       ),
+                      onChanged: (value) =>
+                          setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
                     const SizedBox(height: 12),
                     TextFormField(
@@ -1255,7 +1466,7 @@ class _DocumentPageState extends State<DocumentPage> {
                 FilledButton(
                   onPressed: () => Navigator.pop(dialogContext, {
                     'fileType': fileType,
-                    'size': fileSizeKey,
+                    'fileSize': fileSize,
                     'fileName': fileNameController.text,
                   }),
                   child: const Text('Share'),
@@ -1270,299 +1481,312 @@ class _DocumentPageState extends State<DocumentPage> {
     if (result == null) return;
 
     setState(() => processing = true);
+  showGeneratingDialog(context);
     try {
       final outputPath = await _exportDocumentFile(
         fileType: result['fileType'] ?? 'pdf',
-        fileSizeKey: result['size'] ?? 'Actual',
+        fileSize: result['fileSize'] ?? 'Actual',
         fileName: result['fileName'] ?? _currentName,
       );
 
       if (!mounted) return;
 
-      await Share.shareXFiles(
-        [XFile(outputPath)],
-        text: 'Shared from Scanner Pro',
+      hideGeneratingDialog(context);
+      await Share.shareXFiles([
+        XFile(outputPath),
+      ], text: 'Shared from Scanner Pro');
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Saved to $outputPath')));
+    } catch (error) {
+      if (mounted) hideGeneratingDialog(context);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Export failed: $error')));
+    } finally {
+      if (mounted) setState(() => processing = false);
+    }
+  }
+
+  Future<void> _downloadDocument() async {
+    if (images.isEmpty) return;
+
+    String fileType = 'pdf';
+    String fileSize = 'Actual';
+    final fileNameController = TextEditingController(text: _currentName);
+
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Save as'),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DropdownButtonFormField<String>(
+                      initialValue: fileType,
+                      decoration: const InputDecoration(labelText: 'Save as'),
+                      items: const [
+                        DropdownMenuItem(value: 'pdf', child: Text('pdf')),
+                        DropdownMenuItem(value: 'jpg', child: Text('jpg')),
+                      ],
+                      onChanged: (value) {
+                        final nextType = value ?? fileType;
+                        if (nextType == fileType) return;
+                        setDialogState(() => fileType = nextType);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      initialValue: fileSize,
+                      decoration: const InputDecoration(labelText: 'File Size'),
+                      items: buildExportSizeItems(
+                        documentTotalBytes([widget.document]),
+                      ),
+                      onChanged: (value) =>
+                          setDialogState(() => fileSize = value ?? 'Actual'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: fileNameController,
+                      decoration: const InputDecoration(labelText: 'File Name'),
+                      textCapitalization: TextCapitalization.none,
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, {
+                    'fileType': fileType,
+                    'fileSize': fileSize,
+                    'fileName': fileNameController.text,
+                  }),
+                  child: const Text('Download'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == null) return;
+
+    setState(() => saving = true);
+    showGeneratingDialog(context);
+    try {
+      final outputPath = await _exportDocumentFile(
+        fileType: result['fileType'] ?? 'pdf',
+        fileSize: result['fileSize'] ?? 'Actual',
+        fileName: result['fileName'] ?? _currentName,
       );
 
+      if (!mounted) return;
+      hideGeneratingDialog(context);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Saved to $outputPath')),
+        SnackBar(content: Text('Downloaded to $outputPath')),
       );
     } catch (error) {
+      if (mounted) hideGeneratingDialog(context);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Export failed: $error')),
       );
     } finally {
-      if (mounted) setState(() => processing = false);
-    }
-  }
-
-  Future<void> _savePdf([double scaleFactor = 1.0]) async {
-    if (images.isEmpty) return;
-    setState(() => processing = true);
-    try {
-      final pdf = pw.Document();
-      final pageFormat = pdf_lib.PdfPageFormat.standard.copyWith(
-        width: pdf_lib.PdfPageFormat.standard.width * scaleFactor,
-        height: pdf_lib.PdfPageFormat.standard.height * scaleFactor,
-      );
-
-      for (final imageFile in images) {
-        final bytes = await _scaledImageBytes(imageFile, scaleFactor);
-
-        pdf.addPage(pw.Page(
-          pageFormat: pageFormat,
-          build: (_) => pw.Center(
-            child: pw.Image(
-              pw.MemoryImage(bytes),
-              fit: pw.BoxFit.contain,
-              width: pageFormat.width,
-              height: pageFormat.height,
-            ),
-          ),
-        ));
-      }
-
-      final pdfBytes = await pdf.save();
-      final localFile = widget.document.pdfFile;
-      await localFile.writeAsBytes(pdfBytes);
-
-      final downloadsDir = await StorageService().downloads();
-      final downloadedFile = File(path.join(downloadsDir.path, '${widget.document.name}.pdf'));
-      await downloadedFile.writeAsBytes(pdfBytes);
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Downloaded to ${downloadedFile.path}')),
-        );
-      }
-    } finally {
-      if (mounted) setState(() => processing = false);
-    }
-  }
-
-  Future<void> _saveCombinedJpg() async {
-    if (images.isEmpty) return;
-
-    final decodedImages = <ui.Image>[];
-    for (final imageFile in images) {
-      final bytes = await imageFile.readAsBytes();
-      final codec = await ui.instantiateImageCodec(bytes);
-      final frame = await codec.getNextFrame();
-      decodedImages.add(frame.image);
-    }
-
-    final maxWidth = decodedImages.fold<int>(
-      0,
-      (current, img) => img.width > current ? img.width : current,
-    );
-    final totalHeight = decodedImages.fold<int>(0, (total, img) => total + img.height);
-
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder);
-    final backgroundPaint = Paint()..color = Colors.white;
-
-    canvas.drawRect(
-      Rect.fromLTWH(0, 0, maxWidth.toDouble(), totalHeight.toDouble()),
-      backgroundPaint,
-    );
-
-    var offsetY = 0.0;
-    for (final image in decodedImages) {
-      final pageWidth = image.width.toDouble();
-      final pageHeight = image.height.toDouble();
-      final targetRect = Rect.fromLTWH(
-        (maxWidth - pageWidth) / 2,
-        offsetY,
-        pageWidth,
-        pageHeight,
-      );
-      canvas.drawImageRect(
-        image,
-        Rect.fromLTWH(0, 0, pageWidth, pageHeight),
-        targetRect,
-        Paint(),
-      );
-      offsetY += pageHeight;
-    }
-
-    final picture = recorder.endRecording();
-    final rendered = await picture.toImage(maxWidth, totalHeight);
-    final pngBytesData = await rendered.toByteData(format: ui.ImageByteFormat.png);
-    if (pngBytesData == null) {
-      throw const FormatException('Unable to encode JPG');
-    }
-
-    final pngBytes = pngBytesData.buffer.asUint8List();
-    final decoded = img.decodePng(pngBytes);
-    if (decoded == null) {
-      throw const FormatException('Unable to decode combined image');
-    }
-
-    final jpegBytes = img.encodeJpg(decoded);
-    final downloadsDir = await StorageService().downloads();
-    final outputFile = File(path.join(downloadsDir.path, '${widget.document.name}.jpg'));
-    await outputFile.writeAsBytes(jpegBytes);
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Downloaded JPG to ${outputFile.path}')),
-      );
+      if (mounted) setState(() => saving = false);
     }
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(
-          title: GestureDetector(
-            onTap: _renameDocument,
-            child: Text(_currentName),
+    appBar: AppBar(
+      title: GestureDetector(onTap: _renameDocument, child: Text(_currentName)),
+      actions: [
+        if (images.isNotEmpty)
+          IconButton(
+            tooltip: 'Share document',
+            onPressed: processing ? null : _shareDocument,
+            icon: processing
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.share),
           ),
-          actions: [
-            if (images.isNotEmpty)
-              IconButton(
-                tooltip: 'Share document',
-                onPressed: processing ? null : _shareDocument,
-                icon: processing
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Icon(Icons.share),
-              ),
-          ],
-        ),
-        body: Column(
-          children: [
-            Expanded(
-              child: images.isEmpty
-                  ? const Center(child: Text('Add a picture from the camera or gallery.'))
-                  : GridView.builder(
-                      padding: const EdgeInsets.all(12),
-                      itemCount: images.length,
-                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 2,
-                        crossAxisSpacing: 10,
-                        mainAxisSpacing: 10,
-                        childAspectRatio: 0.8,
-                      ),
-                      itemBuilder: (_, index) {
-                        final file = images[index];
-                        return GestureDetector(
-                          onTap: () => _openImageEditor(file),
-                          child: Stack(
-                            children: [
-                              Positioned.fill(
-                                child: ClipRRect(
-                                  borderRadius: BorderRadius.circular(12),
-                                  child: Image.file(file, fit: BoxFit.cover),
-                                ),
+        if (images.isNotEmpty)
+          IconButton(
+            tooltip: 'Download document',
+            onPressed: saving ? null : _downloadDocument,
+            icon: saving
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.download),
+          ),
+      ],
+    ),
+    body: Column(
+      children: [
+        Expanded(
+          child: images.isEmpty
+              ? const Center(
+                  child: Text('Add a picture from the camera or gallery.'),
+                )
+              : GridView.builder(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: images.length,
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 2,
+                    crossAxisSpacing: 10,
+                    mainAxisSpacing: 10,
+                    childAspectRatio: 0.8,
+                  ),
+                  itemBuilder: (_, index) {
+                    final file = images[index];
+                    return Stack(
+                      key: ValueKey(file.path),
+                        children: [
+                          Positioned.fill(
+                            child: GestureDetector(
+                              onTap: () => _openImageEditor(file),
+                              child: ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: Image.file(file, fit: BoxFit.cover),
                               ),
-                              Positioned.fill(
-                                child: IgnorePointer(
-                                  child: DecoratedBox(
-                                    decoration: const BoxDecoration(
-                                      gradient: LinearGradient(
-                                        begin: Alignment.topCenter,
-                                        end: Alignment.bottomCenter,
-                                        colors: [Colors.transparent, Colors.black54],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              Positioned(
-                                top: 8,
-                                left: 8,
-                                child: IgnorePointer(
-                                  child: Container(
-                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                    decoration: BoxDecoration(
-                                      color: Colors.black54,
-                                      borderRadius: BorderRadius.circular(999),
-                                    ),
-                                    child: Text(
-                                      '${index + 1}',
-                                      style: const TextStyle(
-                                        color: Colors.white,
-                                        fontWeight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              Positioned(
-                                bottom: 8,
-                                left: 8,
-                                right: 42,
-                                child: IgnorePointer(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(
-                                        _formatDate(file),
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        _formatFileSize(file),
-                                        style: const TextStyle(
-                                          color: Colors.white70,
-                                          fontSize: 11,
-                                        ),
-                                      ),
+                            ),
+                          ),
+                          Positioned.fill(
+                            child: IgnorePointer(
+                              child: DecoratedBox(
+                                decoration: const BoxDecoration(
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      Colors.transparent,
+                                      Colors.black54,
                                     ],
                                   ),
                                 ),
                               ),
-                              Positioned(
-                                top: 8,
-                                right: 8,
-                                child: GestureDetector(
-                                  onTap: () => _remove(file),
-                                  child: const CircleAvatar(
-                                    radius: 13,
-                                    backgroundColor: Colors.black54,
-                                    child: Icon(Icons.close, size: 16, color: Colors.white),
+                            ),
+                          ),
+                          Positioned(
+                            top: 8,
+                            left: 8,
+                            child: IgnorePointer(
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.black54,
+                                  borderRadius: BorderRadius.circular(999),
+                                ),
+                                child: Text(
+                                  '${index + 1}',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.w700,
                                   ),
                                 ),
                               ),
-                            ],
+                            ),
                           ),
-                        );
-                      },
-                    ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: () => _add(ImageSource.camera),
-                      icon: const Icon(Icons.camera_alt),
-                      label: const Text('Camera'),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: () => _add(ImageSource.gallery),
-                      icon: const Icon(Icons.photo_library),
-                      label: const Text('Gallery'),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ],
+                          Positioned(
+                            bottom: 8,
+                            left: 8,
+                            right: 42,
+                            child: IgnorePointer(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    _formatDate(file),
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _formatFileSize(file),
+                                    style: const TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 11,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                          Positioned(
+                            top: 8,
+                            right: 8,
+                            child: IconButton(
+                              onPressed: () => _remove(file),
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(
+                                minWidth: 26,
+                                minHeight: 26,
+                              ),
+                              icon: const CircleAvatar(
+                                radius: 13,
+                                backgroundColor: Colors.black54,
+                                child: Icon(
+                                  Icons.close,
+                                  size: 16,
+                                  color: Colors.white,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                    );
+                  },
+                ),
         ),
-      );
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () => _add(ImageSource.camera),
+                  icon: const Icon(Icons.camera_alt),
+                  label: const Text('Camera'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () => _add(ImageSource.gallery),
+                  icon: const Icon(Icons.photo_library),
+                  label: const Text('Gallery'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    ),
+  );
 }
 
 class PdfPreviewPage extends StatefulWidget {
@@ -1576,154 +1800,315 @@ class PdfPreviewPage extends StatefulWidget {
 class _PdfPreviewPageState extends State<PdfPreviewPage> {
   bool saving = false;
 
-  Future<void> _savePdf() async {
-    setState(() => saving = true);
-    try {
-      final pdf = pw.Document();
-      for (final image in widget.document.images) {
-        final bytes = await image.readAsBytes();
-        pdf.addPage(pw.Page(
-          pageFormat: pdf_lib.PdfPageFormat.a4,
-          build: (_) => pw.Center(
-            child: pw.Image(pw.MemoryImage(bytes), fit: pw.BoxFit.contain),
+  Future<void> _renameDocument() async {
+    final controller = TextEditingController(text: widget.document.name);
+    final value = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Rename file'),
+        content: TextField(controller: controller, autofocus: true),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
           ),
-        ));
-      }
-      await widget.document.pdfFile.writeAsBytes(await pdf.save());
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Rename'),
+          ),
+        ],
+      ),
+    );
+
+    final rawName = value?.trim().replaceAll(RegExp(r'[<>:"/\\|?*]'), '-');
+    if (rawName == null || rawName.isEmpty || rawName == widget.document.name)
+      return;
+
+    final destination = Directory(
+      path.join(widget.document.directory.parent.path, rawName),
+    );
+    if (await destination.exists()) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Saved ${widget.document.name}.pdf')),
+          const SnackBar(
+            content: Text('A file with that name already exists.'),
+          ),
         );
       }
+      return;
+    }
+
+    await widget.document.directory.rename(destination.path);
+    widget.document.directory = destination;
+
+    if (!mounted) return;
+    setState(() {});
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Renamed to $rawName')));
+  }
+
+  Future<void> _shareDocument() async {
+    if (widget.document.images.isEmpty) return;
+
+    String fileType = 'pdf';
+    String fileSize = 'Actual';
+    final fileNameController = TextEditingController(
+      text: widget.document.name,
+    );
+
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Share as'),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DropdownButtonFormField<String>(
+                      initialValue: fileType,
+                      decoration: const InputDecoration(labelText: 'Share as'),
+                      items: const [
+                        DropdownMenuItem(value: 'pdf', child: Text('pdf')),
+                        DropdownMenuItem(value: 'jpg', child: Text('jpg')),
+                      ],
+                      onChanged: (value) {
+                        final nextType = value ?? fileType;
+                        if (nextType == fileType) return;
+                        setDialogState(() => fileType = nextType);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      initialValue: fileSize,
+                      decoration: const InputDecoration(labelText: 'File Size'),
+                      items: buildExportSizeItems(
+                        documentTotalBytes([widget.document]),
+                      ),
+                      onChanged: (value) =>
+                          setDialogState(() => fileSize = value ?? 'Actual'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: fileNameController,
+                      decoration: const InputDecoration(labelText: 'File Name'),
+                      textCapitalization: TextCapitalization.none,
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, {
+                    'fileType': fileType,
+                    'fileSize': fileSize,
+                    'fileName': fileNameController.text,
+                  }),
+                  child: const Text('Share'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == null) return;
+
+    showGeneratingDialog(context);
+    try {
+      final outputPath = await exportDocumentImagesToDownloads(
+        images: widget.document.images,
+        fileType: result['fileType'] ?? 'pdf',
+        fileSize: result['fileSize'] ?? 'Actual',
+        fileName: result['fileName'] ?? widget.document.name,
+      );
+
+      if (!mounted) return;
+      hideGeneratingDialog(context);
+      await Share.shareXFiles([
+        XFile(outputPath),
+      ], text: 'Shared from Scanner Pro');
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Saved to $outputPath')));
+    } catch (error) {
+      if (mounted) hideGeneratingDialog(context);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Export failed: $error')));
+    }
+  }
+
+  Future<void> _downloadDocument() async {
+    if (widget.document.images.isEmpty) return;
+
+    String fileType = 'pdf';
+    String fileSize = 'Actual';
+    final fileNameController = TextEditingController(
+      text: widget.document.name,
+    );
+
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Save as'),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DropdownButtonFormField<String>(
+                      initialValue: fileType,
+                      decoration: const InputDecoration(labelText: 'Save as'),
+                      items: const [
+                        DropdownMenuItem(value: 'pdf', child: Text('pdf')),
+                        DropdownMenuItem(value: 'jpg', child: Text('jpg')),
+                      ],
+                      onChanged: (value) {
+                        final nextType = value ?? fileType;
+                        if (nextType == fileType) return;
+                        setDialogState(() => fileType = nextType);
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    DropdownButtonFormField<String>(
+                      initialValue: fileSize,
+                      decoration: const InputDecoration(labelText: 'File Size'),
+                      items: buildExportSizeItems(
+                        documentTotalBytes([widget.document]),
+                      ),
+                      onChanged: (value) =>
+                          setDialogState(() => fileSize = value ?? 'Actual'),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: fileNameController,
+                      decoration: const InputDecoration(labelText: 'File Name'),
+                      textCapitalization: TextCapitalization.none,
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(dialogContext, {
+                    'fileType': fileType,
+                    'fileSize': fileSize,
+                    'fileName': fileNameController.text,
+                  }),
+                  child: const Text('Download'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == null) return;
+
+    setState(() => saving = true);
+    showGeneratingDialog(context);
+    try {
+      final outputPath = await exportDocumentImagesToDownloads(
+        images: widget.document.images,
+        fileType: result['fileType'] ?? 'pdf',
+        fileSize: result['fileSize'] ?? 'Actual',
+        fileName: result['fileName'] ?? widget.document.name,
+      );
+
+      if (!mounted) return;
+      hideGeneratingDialog(context);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Downloaded to $outputPath')));
+    } catch (error) {
+      if (mounted) hideGeneratingDialog(context);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Export failed: $error')));
     } finally {
       if (mounted) setState(() => saving = false);
     }
   }
 
-  Future<void> _saveCombinedJpg() async {
-    if (widget.document.images.isEmpty) return;
-
-    final decodedImages = <img.Image>[];
-    for (final imageFile in widget.document.images) {
-      final bytes = await imageFile.readAsBytes();
-      final decoded = img.decodeImage(bytes);
-      if (decoded == null) continue;
-      decodedImages.add(decoded);
-    }
-
-    if (decodedImages.isEmpty) return;
-
-    final maxWidth = decodedImages.fold<int>(
-      0,
-      (current, page) => page.width > current ? page.width : current,
-    );
-    final totalHeight = decodedImages.fold<int>(0, (total, page) => total + page.height);
-
-    final combined = img.Image(width: maxWidth, height: totalHeight);
-    var y = 0;
-    for (final page in decodedImages) {
-      final xOffset = (maxWidth - page.width) ~/ 2;
-      img.compositeImage(combined, page, dstX: xOffset, dstY: y);
-      y += page.height;
-    }
-
-    final jpegBytes = img.encodeJpg(combined);
-    final downloadsDir = await StorageService().downloads();
-    final outputFile = File(path.join(downloadsDir.path, '${widget.document.name}.jpg'));
-    await outputFile.writeAsBytes(jpegBytes);
-
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Downloaded JPG to ${outputFile.path}')),
-      );
-    }
-  }
-
-  Future<void> _open(BuildContext context) async {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    final pdfExists = await widget.document.pdfFile.exists();
-    if (!context.mounted) return;
-    if (!pdfExists) {
-      messenger?.showSnackBar(
-        const SnackBar(content: Text('Save the PDF first.')),
-      );
-      return;
-    }
-    await OpenFile.open(widget.document.pdfFile.path);
-  }
-
   @override
   Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: Text(widget.document.name)),
-        body: Column(
-          children: [
-            Expanded(
-              child: widget.document.images.isEmpty
-                  ? const Center(child: Text('No pictures in this file.'))
-                  : ListView.separated(
-                      padding: const EdgeInsets.all(12),
-                      itemCount: widget.document.images.length,
-                      separatorBuilder: (_, _) => const SizedBox(height: 12),
-                      itemBuilder: (_, index) {
-                        final file = widget.document.images[index];
-                        return Container(
-                          decoration: BoxDecoration(
-                            color: Colors.white,
-                            borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: Colors.grey.shade300),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.04),
-                                blurRadius: 8,
-                                offset: const Offset(0, 2),
-                              ),
-                            ],
-                          ),
-                          child: ClipRRect(
-                            borderRadius: BorderRadius.circular(12),
-                            child: AspectRatio(
-                              aspectRatio: 0.75,
-                              child: Image.file(file, fit: BoxFit.contain),
-                            ),
-                          ),
-                        );
-                      },
-                    ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(12),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: saving ? null : _savePdf,
-                      icon: const Icon(Icons.save),
-                      label: Text(saving ? 'Saving...' : 'Save PDF'),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: _saveCombinedJpg,
-                      icon: const Icon(Icons.image),
-                      label: const Text('Save JPG'),
-                    ),
-                  ),
-                ],
+    appBar: AppBar(
+      title: GestureDetector(
+        onTap: _renameDocument,
+        child: Text(widget.document.name),
+      ),
+      actions: widget.document.images.isEmpty
+          ? const []
+          : [
+              IconButton(
+                tooltip: 'Share',
+                onPressed: _shareDocument,
+                icon: const Icon(Icons.share),
               ),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-              child: SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: () => _open(context),
-                  icon: const Icon(Icons.open_in_new),
-                  label: const Text('Open PDF'),
+              IconButton(
+                tooltip: 'Download',
+                onPressed: saving ? null : _downloadDocument,
+                icon: saving
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.download),
+              ),
+            ],
+    ),
+    body: widget.document.images.isEmpty
+        ? const Center(child: Text('No pictures in this file.'))
+        : ListView.separated(
+            padding: const EdgeInsets.all(12),
+            itemCount: widget.document.images.length,
+            separatorBuilder: (_, _) => const SizedBox(height: 12),
+            itemBuilder: (_, index) {
+              final file = widget.document.images[index];
+              return Container(
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.grey.shade300),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.04),
+                      blurRadius: 8,
+                      offset: const Offset(0, 2),
+                    ),
+                  ],
                 ),
-              ),
-            ),
-          ],
-        ),
-      );
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: AspectRatio(
+                    aspectRatio: 0.75,
+                    child: Image.file(file, fit: BoxFit.contain),
+                  ),
+                ),
+              );
+            },
+          ),
+  );
 }
