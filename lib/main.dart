@@ -10,7 +10,6 @@ import 'package:path_provider/path_provider.dart';
 import 'package:image_cropper/image_cropper.dart';
 import 'package:pdf/pdf.dart' as pdf_lib;
 import 'package:pdf/widgets.dart' as pw;
-import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 
 void main() => runApp(const ScannerProApp());
@@ -116,7 +115,14 @@ class DocumentFolder {
             ].contains(path.extension(file.path).toLowerCase()),
           )
           .toList()
-        ..sort((a, b) => a.path.compareTo(b.path));
+        ..sort((a, b) {
+          final aIndex = int.tryParse(path.basenameWithoutExtension(a.path));
+          final bIndex = int.tryParse(path.basenameWithoutExtension(b.path));
+          if (aIndex != null && bIndex != null) {
+            return aIndex.compareTo(bIndex);
+          }
+          return a.path.compareTo(b.path);
+        });
 
   @override
   bool operator ==(Object other) =>
@@ -428,14 +434,10 @@ class StorageService {
   }
 
   Future<Directory> root() async {
-    if (Platform.isAndroid) {
-      final permission = await Permission.manageExternalStorage.status;
-      if (!permission.isGranted)
-        await Permission.manageExternalStorage.request();
-    }
-    final root = Platform.isAndroid
-        ? Directory('/storage/emulated/0/Documents/Scanner Pro')
-        : Directory(path.join(Directory.current.path, 'Scanner Pro'));
+    final appDocumentsDirectory = await getApplicationDocumentsDirectory();
+    final root = Directory(
+      path.join(appDocumentsDirectory.path, 'Scanner Pro'),
+    );
     await root.create(recursive: true);
     return root;
   }
@@ -723,9 +725,7 @@ class _HomePageState extends State<HomePage> {
                       initialValue: fileSize,
                       decoration: const InputDecoration(labelText: 'File Size'),
                       items: buildExportSizeItems(
-                        documentTotalBytes(
-                          _selectedDocuments.toList(),
-                        ),
+                        documentTotalBytes(_selectedDocuments.toList()),
                       ),
                       onChanged: (value) =>
                           setDialogState(() => fileSize = value ?? 'Actual'),
@@ -739,11 +739,10 @@ class _HomePageState extends State<HomePage> {
                   child: const Text('Cancel'),
                 ),
                 FilledButton(
-                  onPressed: () =>
-                      Navigator.pop(dialogContext, {
-                        'fileType': fileType,
-                        'fileSize': fileSize,
-                      }),
+                  onPressed: () => Navigator.pop(dialogContext, {
+                    'fileType': fileType,
+                    'fileSize': fileSize,
+                  }),
                   child: const Text('Share'),
                 ),
               ],
@@ -766,6 +765,7 @@ class _HomePageState extends State<HomePage> {
           fileType: result['fileType'] ?? 'pdf',
           fileSize: result['fileSize'] ?? 'Actual',
           fileName: document.name,
+          saveToDownloads: false,
         );
         exportedFiles.add(XFile(exportPath));
       }
@@ -1036,14 +1036,24 @@ int documentTotalBytes(List<DocumentFolder> documents) {
 }
 
 const exportSizeOptions = <String, double>{
-  'Actual': 0.50,
-  'Medium': 0.40,
-  'Small': 0.35,
-  'Smallest': 0.30,
+  'Actual': 0.95,
+  'Medium': 0.90,
+  'Small': 0.80,
+  'Smallest': 0.75,
+};
+
+const exportQualityOptions = <String, int>{
+  'Actual': 95,
+  'Medium': 90,
+  'Small': 80,
+  'Smallest': 75,
 };
 
 double exportScaleForSize(String fileSize) =>
     exportSizeOptions[fileSize] ?? exportSizeOptions['Actual']!;
+
+int exportQualityForSize(String fileSize) =>
+    exportQualityOptions[fileSize] ?? exportQualityOptions['Actual']!;
 
 String formatByteSize(int bytes) {
   if (bytes < 1024) return '${bytes}B';
@@ -1056,12 +1066,8 @@ String formatByteSize(int bytes) {
 List<DropdownMenuItem<String>> buildExportSizeItems(int actualBytes) =>
     exportSizeOptions.entries
         .map(
-          (entry) => DropdownMenuItem(
-            value: entry.key,
-            child: Text(
-              '${entry.key}',
-            ),
-          ),
+          (entry) =>
+              DropdownMenuItem(value: entry.key, child: Text('${entry.key}')),
         )
         .toList();
 
@@ -1142,11 +1148,19 @@ Future<File> _generateExportFile({
 }
 
 img.Image _scaleExportImage(img.Image source, double scaleFactor) {
-  if (scaleFactor >= 1) return source;
+  const maxExportDimension = 1800;
+  final requestedScale = scaleFactor.clamp(0.01, 1.0);
+  final dimensionScale =
+      maxExportDimension /
+      (source.width > source.height ? source.width : source.height);
+  final effectiveScale = requestedScale < dimensionScale
+      ? requestedScale
+      : dimensionScale;
+  if (effectiveScale >= 1) return source;
   return img.copyResize(
     source,
-    width: (source.width * scaleFactor).round().clamp(1, source.width),
-    height: (source.height * scaleFactor).round().clamp(1, source.height),
+    width: (source.width * effectiveScale).round().clamp(1, source.width),
+    height: (source.height * effectiveScale).round().clamp(1, source.height),
   );
 }
 
@@ -1197,16 +1211,14 @@ Future<String> exportDocumentImagesToDownloads({
   required String fileType,
   required String fileName,
   String fileSize = 'Actual',
+  bool saveToDownloads = true,
 }) async {
   final extension = fileType.toLowerCase() == 'jpg' ? 'jpg' : 'pdf';
   final cleanName = sanitizeExportFileName(fileName, extension);
   final fileNameWithExtension = '$cleanName.$extension';
 
   final tempFile = File(
-    path.join(
-      Directory.systemTemp.path,
-      'scanner_pro_${DateTime.now().millisecondsSinceEpoch}_$fileNameWithExtension',
-    ),
+    path.join(Directory.systemTemp.path, fileNameWithExtension),
   );
   await tempFile.parent.create(recursive: true);
 
@@ -1218,10 +1230,14 @@ Future<String> exportDocumentImagesToDownloads({
     fileType: fileType,
     outputFile: tempFile,
     scaleFactor: exportScaleForSize(fileSize),
-    quality: 100,
+    quality: exportQualityForSize(fileSize),
   );
 
   final bytes = await tempFile.readAsBytes();
+  if (!saveToDownloads) {
+    return tempFile.path;
+  }
+
   final mimeType = extension == 'jpg' ? 'image/jpeg' : 'application/pdf';
 
   final targetName = fileNameWithExtension;
@@ -1286,11 +1302,45 @@ class _DocumentPageState extends State<DocumentPage> {
   }
 
   Future<void> _add(ImageSource source) async {
-    final scannerSource = source == ImageSource.camera
-        ? ScannerSource.camera
-        : ScannerSource.gallery;
-
     try {
+      if (source == ImageSource.gallery) {
+        final selectedImages = await ImagePicker().pickMultiImage();
+        if (selectedImages.isEmpty) return;
+
+        final nextIndexStart = images
+            .map(
+              (file) => int.tryParse(path.basenameWithoutExtension(file.path)),
+            )
+            .whereType<int>()
+            .fold<int>(
+              0,
+              (highest, value) => value > highest ? value : highest,
+            );
+        var nextIndex = nextIndexStart + 1;
+        for (final selectedImage in selectedImages) {
+          final sourceFile = File(selectedImage.path);
+          if (!await sourceFile.exists()) continue;
+
+          final extension = path.extension(selectedImage.path).toLowerCase();
+          final safeExtension =
+              ['.jpg', '.jpeg', '.png', '.heic'].contains(extension)
+              ? extension
+              : '.jpg';
+          final target = File(
+            path.join(
+              widget.document.directory.path,
+              '${nextIndex++}$safeExtension',
+            ),
+          );
+          await sourceFile.copy(target.path);
+        }
+
+        if (mounted) setState(() {});
+        return;
+      }
+
+      const scannerSource = ScannerSource.camera;
+      await CunningDocumentScanner.cleanCache();
       final scannedPaths = await CunningDocumentScanner.getPictures(
         scannerSource: scannerSource,
         noOfPages: 50,
@@ -1298,11 +1348,11 @@ class _DocumentPageState extends State<DocumentPage> {
 
       if (scannedPaths == null || scannedPaths.isEmpty) return;
 
-      var nextIndex = 1;
-      final existingNames = images.map((file) => path.basenameWithoutExtension(file.path)).toSet();
-      while (existingNames.contains('$nextIndex')) {
-        nextIndex++;
-      }
+      final nextIndexStart = images
+          .map((file) => int.tryParse(path.basenameWithoutExtension(file.path)))
+          .whereType<int>()
+          .fold<int>(0, (highest, value) => value > highest ? value : highest);
+      var nextIndex = nextIndexStart + 1;
       for (final scannedPath in scannedPaths) {
         final scannedFile = File(scannedPath);
         if (!await scannedFile.exists()) continue;
@@ -1311,10 +1361,6 @@ class _DocumentPageState extends State<DocumentPage> {
           path.join(widget.document.directory.path, '${nextIndex++}.jpg'),
         );
         await scannedFile.copy(target.path);
-        existingNames.add(path.basenameWithoutExtension(target.path));
-        while (existingNames.contains('$nextIndex')) {
-          nextIndex++;
-        }
       }
 
       await CunningDocumentScanner.cleanCache();
@@ -1324,6 +1370,12 @@ class _DocumentPageState extends State<DocumentPage> {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Could not add image: $error')));
       }
     }
   }
@@ -1398,12 +1450,14 @@ class _DocumentPageState extends State<DocumentPage> {
     required String fileType,
     required String fileName,
     required String fileSize,
+    bool saveToDownloads = true,
   }) async {
     return exportDocumentImagesToDownloads(
       images: images,
       fileType: fileType,
       fileName: fileName,
       fileSize: fileSize,
+      saveToDownloads: saveToDownloads,
     );
   }
 
@@ -1481,12 +1535,13 @@ class _DocumentPageState extends State<DocumentPage> {
     if (result == null) return;
 
     setState(() => processing = true);
-  showGeneratingDialog(context);
+    showGeneratingDialog(context);
     try {
       final outputPath = await _exportDocumentFile(
         fileType: result['fileType'] ?? 'pdf',
         fileSize: result['fileSize'] ?? 'Actual',
         fileName: result['fileName'] ?? _currentName,
+        saveToDownloads: false,
       );
 
       if (!mounted) return;
@@ -1594,15 +1649,15 @@ class _DocumentPageState extends State<DocumentPage> {
 
       if (!mounted) return;
       hideGeneratingDialog(context);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Downloaded to $outputPath')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Downloaded to $outputPath')));
     } catch (error) {
       if (mounted) hideGeneratingDialog(context);
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Export failed: $error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Export failed: $error')));
     } finally {
       if (mounted) setState(() => saving = false);
     }
@@ -1659,105 +1714,102 @@ class _DocumentPageState extends State<DocumentPage> {
                     final file = images[index];
                     return Stack(
                       key: ValueKey(file.path),
-                        children: [
-                          Positioned.fill(
-                            child: GestureDetector(
-                              onTap: () => _openImageEditor(file),
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(12),
-                                child: Image.file(file, fit: BoxFit.cover),
-                              ),
+                      children: [
+                        Positioned.fill(
+                          child: GestureDetector(
+                            onTap: () => _openImageEditor(file),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(12),
+                              child: Image.file(file, fit: BoxFit.cover),
                             ),
                           ),
-                          Positioned.fill(
-                            child: IgnorePointer(
-                              child: DecoratedBox(
-                                decoration: const BoxDecoration(
-                                  gradient: LinearGradient(
-                                    begin: Alignment.topCenter,
-                                    end: Alignment.bottomCenter,
-                                    colors: [
-                                      Colors.transparent,
-                                      Colors.black54,
-                                    ],
-                                  ),
+                        ),
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: DecoratedBox(
+                              decoration: const BoxDecoration(
+                                gradient: LinearGradient(
+                                  begin: Alignment.topCenter,
+                                  end: Alignment.bottomCenter,
+                                  colors: [Colors.transparent, Colors.black54],
                                 ),
                               ),
                             ),
                           ),
-                          Positioned(
-                            top: 8,
-                            left: 8,
-                            child: IgnorePointer(
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 8,
-                                  vertical: 4,
+                        ),
+                        Positioned(
+                          top: 8,
+                          left: 8,
+                          child: IgnorePointer(
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: Colors.black54,
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: Text(
+                                '${index + 1}',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.w700,
                                 ),
-                                decoration: BoxDecoration(
-                                  color: Colors.black54,
-                                  borderRadius: BorderRadius.circular(999),
-                                ),
-                                child: Text(
-                                  '${index + 1}',
+                              ),
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          bottom: 8,
+                          left: 8,
+                          right: 42,
+                          child: IgnorePointer(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  _formatDate(file),
                                   style: const TextStyle(
                                     color: Colors.white,
-                                    fontWeight: FontWeight.w700,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
                                   ),
                                 ),
-                              ),
-                            ),
-                          ),
-                          Positioned(
-                            bottom: 8,
-                            left: 8,
-                            right: 42,
-                            child: IgnorePointer(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    _formatDate(file),
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w600,
-                                    ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  _formatFileSize(file),
+                                  style: const TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 11,
                                   ),
-                                  const SizedBox(height: 2),
-                                  Text(
-                                    _formatFileSize(file),
-                                    style: const TextStyle(
-                                      color: Colors.white70,
-                                      fontSize: 11,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          Positioned(
-                            top: 8,
-                            right: 8,
-                            child: IconButton(
-                              onPressed: () => _remove(file),
-                              padding: EdgeInsets.zero,
-                              constraints: const BoxConstraints(
-                                minWidth: 26,
-                                minHeight: 26,
-                              ),
-                              icon: const CircleAvatar(
-                                radius: 13,
-                                backgroundColor: Colors.black54,
-                                child: Icon(
-                                  Icons.close,
-                                  size: 16,
-                                  color: Colors.white,
                                 ),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Positioned(
+                          top: 8,
+                          right: 8,
+                          child: IconButton(
+                            onPressed: () => _remove(file),
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(
+                              minWidth: 26,
+                              minHeight: 26,
+                            ),
+                            icon: const CircleAvatar(
+                              radius: 13,
+                              backgroundColor: Colors.black54,
+                              child: Icon(
+                                Icons.close,
+                                size: 16,
+                                color: Colors.white,
                               ),
                             ),
                           ),
-                        ],
+                        ),
+                      ],
                     );
                   },
                 ),
@@ -1930,6 +1982,7 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
         fileType: result['fileType'] ?? 'pdf',
         fileSize: result['fileSize'] ?? 'Actual',
         fileName: result['fileName'] ?? widget.document.name,
+        saveToDownloads: false,
       );
 
       if (!mounted) return;
@@ -2053,6 +2106,7 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    backgroundColor: Colors.grey.shade200,
     appBar: AppBar(
       title: GestureDetector(
         onTap: _renameDocument,
@@ -2090,22 +2144,19 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
               return Container(
                 decoration: BoxDecoration(
                   color: Colors.white,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.grey.shade300),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.04),
-                      blurRadius: 8,
+                      color: Colors.black.withValues(alpha: 0.14),
+                      blurRadius: 5,
                       offset: const Offset(0, 2),
                     ),
                   ],
                 ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: AspectRatio(
-                    aspectRatio: 0.75,
-                    child: Image.file(file, fit: BoxFit.contain),
-                  ),
+                child: AspectRatio(
+                  aspectRatio:
+                      pdf_lib.PdfPageFormat.standard.width /
+                      pdf_lib.PdfPageFormat.standard.height,
+                  child: Image.file(file, fit: BoxFit.contain),
                 ),
               );
             },
