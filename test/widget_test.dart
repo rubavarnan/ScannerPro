@@ -91,4 +91,31 @@ void main() {
 
     expect(find.text('Rename file'), findsOneWidget);
   });
+
+  testWidgets('keeps document actions visible with a long name on a narrow screen', (
+    WidgetTester tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 640);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final tempDir = await Directory.systemTemp.createTemp('scanner_pro_narrow_test_');
+    addTearDown(() async => tempDir.delete(recursive: true));
+    final documentDir = Directory(
+      '${tempDir.path}/A document name that is deliberately very long',
+    );
+    await documentDir.create(recursive: true);
+    final image = img.Image(width: 8, height: 8);
+    await File('${documentDir.path}/1.jpg').writeAsBytes(img.encodeJpg(image));
+
+    await tester.pumpWidget(MaterialApp(
+      home: DocumentPage(document: DocumentFolder(documentDir)),
+    ));
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+    expect(find.byTooltip('Share document'), findsOneWidget);
+    expect(find.byTooltip('Download document'), findsOneWidget);
+  });
 }

@@ -36,9 +36,11 @@ dependencies:
   intl: ^0.20.2
   open_file: ^3.2.1
   path_provider: ^2.0.15
+  shared_preferences: ^2.5.3
   path: ^1.8.4
   image: ^4.5.0
   pdf: ^3.11.1
+  pdfx: ^2.11.0
   cunning_document_scanner: ^3.0.3
   archive: ^4.0.9
   share_plus: ^11.0.0
