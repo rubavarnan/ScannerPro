@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -15,60 +16,267 @@ void main() {
     expect(find.byType(HomePage), findsOneWidget);
   });
 
-  test('uses the standard platform Downloads directory without nesting a Scanner Pro folder', () {
-    final androidDownloads = StorageService.standardDownloadsDirectory(
-      operatingSystem: 'android',
-      downloadsDirectoryPath: '/storage/emulated/0/Download',
+  testWidgets('watermark dialog starts with watermark text and opacity', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () => showDialog<TextAnnotationOptions>(
+                context: context,
+                builder: (_) => const TextEntryDialog(isWatermark: true),
+              ),
+              child: const Text('Open watermark'),
+            ),
+          ),
+        ),
+      ),
     );
-    expect(androidDownloads.path, '/storage/emulated/0/Download');
 
-    final windowsDownloads = StorageService.standardDownloadsDirectory(
-      operatingSystem: 'windows',
-      homeDirectory: r'C:\Users\TestUser',
+    await tester.tap(find.text('Open watermark'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Add watermark'), findsOneWidget);
+    expect(
+      tester.widget<TextField>(find.byType(TextField)).controller!.text,
+      'WATERMARK',
     );
-    expect(windowsDownloads.path, r'C:\Users\TestUser\Downloads');
+    expect(tester.widgetList<Slider>(find.byType(Slider)).last.value, 0.35);
   });
 
-  test('keeps the custom export filename without duplicating the extension', () {
-    expect(sanitizeExportFileName('Invoice', 'jpg'), 'Invoice');
-    expect(sanitizeExportFileName('Invoice.jpg', 'jpg'), 'Invoice');
-    expect(sanitizeExportFileName('Invoice.pdf', 'jpg'), 'Invoice.pdf');
-    expect(sanitizeExportFileName('  My Report  ', 'jpg'), 'My Report');
+  test(
+    'uses the standard platform Downloads directory without nesting a Scanner Pro folder',
+    () {
+      final androidDownloads = StorageService.standardDownloadsDirectory(
+        operatingSystem: 'android',
+        downloadsDirectoryPath: '/storage/emulated/0/Download',
+      );
+      expect(androidDownloads.path, '/storage/emulated/0/Download');
+
+      final windowsDownloads = StorageService.standardDownloadsDirectory(
+        operatingSystem: 'windows',
+        homeDirectory: r'C:\Users\TestUser',
+      );
+      expect(windowsDownloads.path, r'C:\Users\TestUser\Downloads');
+    },
+  );
+
+  test(
+    'keeps the custom export filename without duplicating the extension',
+    () {
+      expect(sanitizeExportFileName('Invoice', 'jpg'), 'Invoice');
+      expect(sanitizeExportFileName('Invoice.jpg', 'jpg'), 'Invoice');
+      expect(sanitizeExportFileName('Invoice.pdf', 'jpg'), 'Invoice.pdf');
+      expect(sanitizeExportFileName('  My Report  ', 'jpg'), 'My Report');
+    },
+  );
+
+  test('Actual export uses 95 percent scale', () {
+    expect(exportScaleForSize('Actual'), 0.95);
+    expect(exportQualityForSize('Actual'), 95);
+    expect(
+      shouldEmbedOriginalJpegInPdf(scaleFactor: 1.0, quality: 100),
+      isTrue,
+    );
+    expect(
+      shouldEmbedOriginalJpegInPdf(
+        scaleFactor: exportScaleForSize('Actual'),
+        quality: exportQualityForSize('Actual'),
+      ),
+      isFalse,
+    );
+    expect(
+      shouldKeepOriginalJpegExport(
+        scaleFactor: 1.0,
+        quality: 100,
+        width: 1200,
+        height: 800,
+      ),
+      isTrue,
+    );
+    expect(
+      shouldKeepOriginalJpegExport(
+        scaleFactor: 0.9,
+        quality: 100,
+        width: 1200,
+        height: 800,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldKeepOriginalJpegExport(
+        scaleFactor: 1.0,
+        quality: 95,
+        width: 1200,
+        height: 800,
+      ),
+      isFalse,
+    );
+    expect(
+      shouldKeepOriginalJpegExport(
+        scaleFactor: 1.0,
+        quality: 100,
+        width: 2000,
+        height: 800,
+      ),
+      isFalse,
+    );
   });
 
-  test('exports JPG and PDF files successfully without a size selector', () async {
-    final tempDir = await Directory.systemTemp.createTemp('scanner_pro_export_test_');
-    addTearDown(() async => tempDir.delete(recursive: true));
-
-    final image = img.Image(width: 1200, height: 800);
-    for (var y = 0; y < image.height; y++) {
-      for (var x = 0; x < image.width; x++) {
-        image.setPixelRgba(x, y, 120, 140, 180, 255);
-      }
+  test('reduced export sizes stay distinct after the resolution cap', () {
+    (int, int) dimensionsFor(String size) {
+      final scale = exportScaleForDimensions(
+        width: 4000,
+        height: 2000,
+        requestedScale: exportScaleForSize(size),
+      );
+      return ((4000 * scale).round(), (2000 * scale).round());
     }
 
-    final sourceFile = File('${tempDir.path}/source.jpg');
-    await sourceFile.writeAsBytes(img.encodeJpg(image, quality: 100));
-
-    final jpgPath = await exportDocumentImagesToDownloads(
-      images: [sourceFile],
-      fileType: 'jpg',
-      fileName: 'exported_jpg',
-    );
-    final pdfPath = await exportDocumentImagesToDownloads(
-      images: [sourceFile],
-      fileType: 'pdf',
-      fileName: 'exported_pdf',
-    );
-
-    expect(File(jpgPath).existsSync(), isTrue);
-    expect(File(pdfPath).existsSync(), isTrue);
-    expect(File(jpgPath).lengthSync(), greaterThan(0));
-    expect(File(pdfPath).lengthSync(), greaterThan(0));
+    expect(dimensionsFor('Actual'), (1710, 855));
+    expect(dimensionsFor('Medium'), (1620, 810));
+    expect(dimensionsFor('Small'), (1440, 720));
+    expect(dimensionsFor('X-Small'), (1260, 630));
+    expect(dimensionsFor('Smallest'), (1080, 540));
   });
 
-  testWidgets('tapping the document name opens the rename dialog', (WidgetTester tester) async {
-    final tempDir = await Directory.systemTemp.createTemp('scanner_pro_rename_test_');
+  test(
+    'exports JPG and PDF files successfully without a size selector',
+    () async {
+      final tempDir = await Directory.systemTemp.createTemp(
+        'scanner_pro_export_test_',
+      );
+      addTearDown(() async => tempDir.delete(recursive: true));
+
+      final image = img.Image(width: 480, height: 320);
+      for (var y = 0; y < image.height; y++) {
+        for (var x = 0; x < image.width; x++) {
+          image.setPixelRgba(
+            x,
+            y,
+            (x * 73 + y * 31) % 256,
+            (x * 17 + y * 97) % 256,
+            (x * 43 + y * 11) % 256,
+            255,
+          );
+        }
+      }
+
+      final sourceFile = File('${tempDir.path}/source.jpg');
+      await sourceFile.writeAsBytes(img.encodeJpg(image, quality: 100));
+      final originalJpegBytes = await sourceFile.readAsBytes();
+
+      final jpgPath = await exportDocumentImagesToDownloads(
+        images: [sourceFile],
+        fileType: 'jpg',
+        fileName: 'exported_jpg',
+      );
+      final pdfPaths = <String>[];
+      for (final fileSize in [
+        'Actual',
+        'Medium',
+        'Small',
+        'X-Small',
+        'Smallest',
+      ]) {
+        final pdfPath = await exportDocumentImagesToDownloads(
+          images: [sourceFile],
+          fileType: 'pdf',
+          fileName: 'exported_pdf_$fileSize',
+          fileSize: fileSize,
+          saveToDownloads: false,
+        );
+        pdfPaths.add(pdfPath);
+        addTearDown(() async => File(pdfPath).delete());
+      }
+
+      expect(File(jpgPath).existsSync(), isTrue);
+      for (final pdfPath in pdfPaths) {
+        expect(File(pdfPath).existsSync(), isTrue);
+      }
+      expect(File(jpgPath).lengthSync(), greaterThan(0));
+      final pdfSizes = pdfPaths.map((pdfPath) => File(pdfPath).lengthSync());
+      expect(pdfSizes.toSet(), hasLength(5));
+      final orderedPdfSizes = pdfSizes.toList();
+      for (var index = 0; index < orderedPdfSizes.length - 1; index++) {
+        expect(orderedPdfSizes[index], greaterThan(orderedPdfSizes[index + 1]));
+      }
+      for (final pdfPath in pdfPaths) {
+        expect(
+          _containsBytes(await File(pdfPath).readAsBytes(), originalJpegBytes),
+          isFalse,
+        );
+      }
+    },
+  );
+
+  testWidgets('image placement moves and resizes an image overlay', (
+    WidgetTester tester,
+  ) async {
+    final baseImage = img.Image(width: 32, height: 32);
+    img.fill(baseImage, color: img.ColorRgb8(20, 40, 180));
+    final overlayImage = img.Image(width: 8, height: 8);
+    img.fill(overlayImage, color: img.ColorRgb8(220, 30, 20));
+    Uint8List? placedBytes;
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: TextButton(
+              onPressed: () async {
+                placedBytes = await showDialog<Uint8List>(
+                  context: context,
+                  builder: (_) => ImagePlacementDialog(
+                    imageBytes: Uint8List.fromList(img.encodePng(baseImage)),
+                    overlayBytes: Uint8List.fromList(
+                      img.encodePng(overlayImage),
+                    ),
+                  ),
+                );
+              },
+              child: const Text('Open placement'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Open placement'));
+    await tester.pumpAndSettle();
+    expect(find.text('Place image'), findsOneWidget);
+
+    await tester.drag(
+      find.byKey(const ValueKey('image-overlay')),
+      const Offset(24, 12),
+    );
+    await tester.pumpAndSettle();
+    await tester.drag(
+      find.byKey(const ValueKey('image-overlay-resize')),
+      const Offset(24, 12),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Apply'));
+    await tester.pumpAndSettle();
+
+    expect(placedBytes, isNotNull);
+    final composited = img.decodeImage(placedBytes!);
+    expect(composited, isNotNull);
+    expect(composited!.width, baseImage.width);
+    expect(composited.height, baseImage.height);
+    final overlayPixel = composited.getPixel(16, 16);
+    expect(overlayPixel.r, greaterThan(overlayPixel.b));
+  });
+
+  testWidgets('tapping the document name opens the rename dialog', (
+    WidgetTester tester,
+  ) async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'scanner_pro_rename_test_',
+    );
     addTearDown(() async => tempDir.delete(recursive: true));
 
     final documentDir = Directory('${tempDir.path}/Invoice');
@@ -82,40 +290,60 @@ void main() {
     final imageFile = File('${documentDir.path}/1.jpg');
     await imageFile.writeAsBytes(img.encodeJpg(image, quality: 90));
 
-    await tester.pumpWidget(MaterialApp(
-      home: DocumentPage(document: DocumentFolder(documentDir)),
-    ));
+    await tester.pumpWidget(
+      MaterialApp(home: DocumentPage(document: DocumentFolder(documentDir))),
+    );
 
     await tester.tap(find.text('Invoice'));
     await tester.pumpAndSettle();
 
     expect(find.text('Rename file'), findsOneWidget);
+    expect(find.text('Save'), findsOneWidget);
   });
 
-  testWidgets('keeps document actions visible with a long name on a narrow screen', (
-    WidgetTester tester,
-  ) async {
-    tester.view.physicalSize = const Size(320, 640);
-    tester.view.devicePixelRatio = 1;
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
+  testWidgets(
+    'keeps document actions visible with a long name on a narrow screen',
+    (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(320, 640);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
 
-    final tempDir = await Directory.systemTemp.createTemp('scanner_pro_narrow_test_');
-    addTearDown(() async => tempDir.delete(recursive: true));
-    final documentDir = Directory(
-      '${tempDir.path}/A document name that is deliberately very long',
-    );
-    await documentDir.create(recursive: true);
-    final image = img.Image(width: 8, height: 8);
-    await File('${documentDir.path}/1.jpg').writeAsBytes(img.encodeJpg(image));
+      final tempDir = await Directory.systemTemp.createTemp(
+        'scanner_pro_narrow_test_',
+      );
+      addTearDown(() async => tempDir.delete(recursive: true));
+      final documentDir = Directory(
+        '${tempDir.path}/A document name that is deliberately very long',
+      );
+      await documentDir.create(recursive: true);
+      final image = img.Image(width: 8, height: 8);
+      await File(
+        '${documentDir.path}/1.jpg',
+      ).writeAsBytes(img.encodeJpg(image));
 
-    await tester.pumpWidget(MaterialApp(
-      home: DocumentPage(document: DocumentFolder(documentDir)),
-    ));
-    await tester.pump();
+      await tester.pumpWidget(
+        MaterialApp(home: DocumentPage(document: DocumentFolder(documentDir))),
+      );
+      await tester.pump();
 
-    expect(tester.takeException(), isNull);
-    expect(find.byTooltip('Share document'), findsOneWidget);
-    expect(find.byTooltip('Download document'), findsOneWidget);
-  });
+      expect(tester.takeException(), isNull);
+      expect(find.byTooltip('Share document'), findsOneWidget);
+      expect(find.byTooltip('Download document'), findsOneWidget);
+    },
+  );
+}
+
+bool _containsBytes(List<int> bytes, List<int> sequence) {
+  for (var start = 0; start <= bytes.length - sequence.length; start++) {
+    var matches = true;
+    for (var index = 0; index < sequence.length; index++) {
+      if (bytes[start + index] != sequence[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return true;
+  }
+  return false;
 }

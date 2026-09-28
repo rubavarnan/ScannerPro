@@ -45,7 +45,8 @@ dependencies:
   archive: ^4.0.9
   share_plus: ^11.0.0
   image_cropper: ^9.1.0
-
+  flutter_bicubic_resize: ^1.9.0
+  google_mlkit_text_recognition: ^0.17.1
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -57,6 +58,7 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_native_splash: ^2.4.8
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -74,9 +76,18 @@ flutter_launcher_icons:
   ios: true
   web:
     generate: true
-  image_path: assets/logo.png
+  image_path: assets/icon.png
   adaptive_icon_background: '#FFFFFF'
-  adaptive_icon_foreground: assets/logo.png
+  adaptive_icon_foreground: assets/icon.png
+
+flutter_native_splash:
+  android: true
+  ios: true
+  color: '#FFFFFF'
+  image: assets/logo1.png
+  android_12:
+    color: '#FFFFFF'
+    image: assets/logo1.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:

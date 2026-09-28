@@ -38,7 +38,12 @@ class MainActivity : FlutterActivity() {
                     "saveFile" -> {
                         val fileName = call.argument<String>("fileName") ?: "download"
                         val mimeType = call.argument<String>("mimeType") ?: "application/octet-stream"
-                        val bytes = call.argument<ByteArray>("bytes") ?: byteArrayOf()
+                        val sourcePath = call.argument<String>("sourcePath")
+                        val sourceFile = sourcePath?.let { File(it) }
+                        if (sourceFile == null || !sourceFile.isFile) {
+                            result.error("SAVE_FAILED", "Export file is unavailable", null)
+                            return@setMethodCallHandler
+                        }
 
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                             val uniqueFileName = nextAvailableDisplayName(fileName)
@@ -62,9 +67,11 @@ class MainActivity : FlutterActivity() {
                             }
 
                             try {
-                                resolver.openOutputStream(uri)?.use { output ->
-                                    output.write(bytes)
-                                } ?: throw IllegalStateException("Could not open the Downloads entry")
+                                sourceFile.inputStream().use { input ->
+                                    resolver.openOutputStream(uri)?.use { output ->
+                                        input.copyTo(output)
+                                    } ?: throw IllegalStateException("Could not open the Downloads entry")
+                                }
                             } catch (error: Exception) {
                                 resolver.delete(uri, null, null)
                                 result.error("SAVE_FAILED", error.message, null)
@@ -87,7 +94,7 @@ class MainActivity : FlutterActivity() {
                                 nextAvailableFileName(fileName),
                             )
                             file.parentFile?.mkdirs()
-                            file.writeBytes(bytes)
+                            sourceFile.copyTo(file)
                             result.success(file.absolutePath)
                         }
                     }
