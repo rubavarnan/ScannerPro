@@ -1,0 +1,267 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Generate native splash screens",
+			"type": "shell",
+			"command": "dart",
+			"args": [
+				"run",
+				"flutter_native_splash:create"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Inspect generated splash changes",
+			"type": "shell",
+			"command": "git",
+			"args": [
+				"status",
+				"--short"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Build Android debug APK arm64",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"build",
+				"apk",
+				"--debug",
+				"--target-platform",
+				"android-arm64"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Audit generated build artifacts",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-PSDrive C | Select-Object Name,Free,Used; $paths = @('build','android\\build','android\\app\\build','.dart_tool'); foreach ($item in $paths) { if (Test-Path $item) { $size = (Get-ChildItem -LiteralPath $item -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum; [PSCustomObject]@{Path=$item; Bytes=$size} } }"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Clean generated Flutter build files",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"clean"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Check free disk space",
+			"type": "shell",
+			"command": "Get-PSDrive",
+			"args": [
+				"C"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Remove malformed Android NDK",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$ndk = 'C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973'; if (Test-Path -LiteralPath $ndk) { Remove-Item -LiteralPath $ndk -Recurse -Force; Write-Output 'Removed malformed NDK 27.0.12077973' } else { Write-Output 'Malformed NDK directory was already absent' }"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Remove malformed Android NDK",
+			"type": "shell",
+			"command": "cmd.exe",
+			"args": [
+				"/c",
+				"if exist \"C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973\" (rmdir /s /q \"C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973\" && echo Removed malformed NDK 27.0.12077973) else (echo NDK directory already absent)"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Delete NDK 27 malformed install one-time",
+			"type": "shell",
+			"command": "cmd.exe",
+			"args": [
+				"/c",
+				"rmdir",
+				"/s",
+				"/q",
+				"C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify NDK cleanup status one-time",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"if (Test-Path -LiteralPath 'C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973') { Write-Output 'NDK_STILL_PRESENT' } else { Write-Output 'NDK_REMOVED' }; Get-PSDrive C | Select-Object Name,Free"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Remove partial NDK before rebuild Sep27",
+			"type": "shell",
+			"command": "cmd.exe",
+			"args": [
+				"/c",
+				"rmdir",
+				"/s",
+				"/q",
+				"C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Clear incomplete NDK download after failed build",
+			"type": "shell",
+			"command": "cmd.exe",
+			"args": [
+				"/c",
+				"rmdir",
+				"/s",
+				"/q",
+				"C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Check disk and partial NDK cleanup",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"if (Test-Path -LiteralPath 'C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973') { Write-Output 'PARTIAL_NDK_PRESENT' } else { Write-Output 'PARTIAL_NDK_CLEARED' }; Get-PSDrive C | Select-Object Name,Free"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Clean project build outputs after failed NDK download",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"clean"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Check recovered space after Flutter clean",
+			"type": "shell",
+			"command": "powershell",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"Get-PSDrive C | Select-Object Name,Free,Used; if (Test-Path -LiteralPath 'C:\\Users\\LENOVO\\AppData\\Local\\Android\\sdk\\ndk\\27.0.12077973') { Write-Output 'PARTIAL_NDK_PRESENT' } else { Write-Output 'PARTIAL_NDK_CLEARED' }"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Inspect Android SDK temporary installer files",
+			"type": "shell",
+			"command": "cmd.exe",
+			"args": [
+				"/c",
+				"dir",
+				"/a",
+				"C:\\Users\\LENOVO\\AppData\\Local\\Android\\Sdk\\temp"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify rebuilt arm64 APK artifact",
+			"type": "shell",
+			"command": "cmd.exe",
+			"args": [
+				"/c",
+				"dir",
+				"build\\app\\outputs\\flutter-apk\\app-debug.apk"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Test reduced JPEG PDF passthrough one-time",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"test/widget_test.dart"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Validate Actual 95 percent export tests",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"test/widget_test.dart"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Verify Actual 95 scale and quality test Sep27b",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"test/widget_test.dart"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Run Actual export preset test only Sep27",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"test",
+				"test/widget_test.dart",
+				"--plain-name",
+				"Actual export uses 95 percent scale"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Build release App Bundle smoke check",
+			"type": "shell",
+			"command": "flutter",
+			"args": [
+				"build",
+				"appbundle",
+				"--release"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

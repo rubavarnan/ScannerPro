@@ -1,10 +1,14 @@
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:ui' as ui;
 
 import 'package:cunning_document_scanner/cunning_document_scanner.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_bicubic_resize/flutter_bicubic_resize.dart' as bicubic;
+import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as path;
@@ -17,6 +21,7 @@ import 'package:pdfx/pdfx.dart';
 import 'package:share_plus/share_plus.dart';
 
 const _openWithChannel = MethodChannel('scanner_pro/downloads');
+final _generatingProgress = ValueNotifier<int>(0);
 
 void main() => runApp(const ScannerProApp());
 
@@ -35,21 +40,28 @@ class MyApp extends ScannerProApp {
   const MyApp({super.key});
 }
 
-void showGeneratingDialog(BuildContext context) {
+void showGeneratingDialog(
+  BuildContext context, {
+  String message = 'Generating...',
+}) {
+  _generatingProgress.value = 0;
   showDialog<void>(
     context: context,
     barrierDismissible: false,
-    builder: (_) => const AlertDialog(
+    builder: (_) => AlertDialog(
       content: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          SizedBox(
+          const SizedBox(
             width: 24,
             height: 24,
             child: CircularProgressIndicator(strokeWidth: 3),
           ),
-          SizedBox(width: 16),
-          Text('Generating...'),
+          const SizedBox(width: 16),
+          ValueListenableBuilder<int>(
+            valueListenable: _generatingProgress,
+            builder: (_, progress, _) => Text('$message $progress%'),
+          ),
         ],
       ),
     ),
@@ -131,14 +143,16 @@ class DocumentFolder {
 
   DateTime get modifiedDate {
     final files = directory.listSync().whereType<File>();
-    return files.fold<DateTime>(
-      directory.statSync().modified,
-      (latest, file) {
-        final modified = file.statSync().modified;
-        return modified.isAfter(latest) ? modified : latest;
-      },
-    );
+    return files.fold<DateTime>(directory.statSync().modified, (latest, file) {
+      final modified = file.statSync().modified;
+      return modified.isAfter(latest) ? modified : latest;
+    });
   }
+
+  int get sizeBytes => directory
+      .listSync()
+      .whereType<File>()
+      .fold<int>(0, (total, file) => total + file.lengthSync());
 
   List<File> get images =>
       directory
@@ -181,6 +195,7 @@ class ImageEditorPage extends StatefulWidget {
 
 class _ImageEditorPageState extends State<ImageEditorPage> {
   late File _currentFile;
+  Uint8List? _displayedBytes;
   int _brightness = 0;
   int _contrast = 0;
   bool _showOriginal = false;
@@ -191,6 +206,13 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   void initState() {
     super.initState();
     _currentFile = widget.file;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final initialBytes = await widget.file.readAsBytes();
+      if (mounted) {
+        setState(() => _displayedBytes = initialBytes);
+      }
+    });
   }
 
   Future<void> _runAction(Future<void> Function() action) async {
@@ -206,7 +228,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   }
 
   Future<File> _persistEditedImage(Uint8List bytes, String suffix) async {
-    final compressed = compressEditedImage(bytes);
+    final compressed = compressEditedImage(bytes, quality: 82);
     final tempDir = await getTemporaryDirectory();
     final target = File(
       path.join(
@@ -215,6 +237,9 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       ),
     );
     await target.writeAsBytes(compressed);
+    if (mounted) {
+      setState(() => _displayedBytes = compressed);
+    }
     return target;
   }
 
@@ -230,12 +255,13 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       brightness: _brightness,
       contrast: _contrast,
     );
-    final output = Uint8List.fromList(img.encodeJpg(enhanced, quality: 100));
+    final output = Uint8List.fromList(img.encodeJpg(enhanced, quality: 82));
     final updated = await _persistEditedImage(output, 'enhanced');
     if (!mounted) return;
     setState(() {
       _showOriginal = false;
       _currentFile = updated;
+      _displayedBytes = _displayedBytes ?? output;
       _enhancementBaseFile ??= source;
     });
   }
@@ -283,23 +309,27 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     if (decoded == null) return;
 
     final rotated = img.copyRotate(decoded, angle: 90);
-    final output = Uint8List.fromList(img.encodeJpg(rotated));
+    final output = Uint8List.fromList(img.encodeJpg(rotated, quality: 82));
     final updated = await _persistEditedImage(output, 'rotated');
     if (mounted) {
       setState(() {
         _showOriginal = false;
         _currentFile = updated;
+        _displayedBytes = output;
         _enhancementBaseFile = null;
       });
     }
   }
 
   Future<void> _resetImage() async {
+    final originalBytes = await widget.file.readAsBytes();
+    if (!mounted) return;
     setState(() {
       _brightness = 0;
       _contrast = 0;
       _showOriginal = false;
       _currentFile = widget.file;
+      _displayedBytes = originalBytes;
       _enhancementBaseFile = null;
     });
   }
@@ -329,14 +359,23 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     setState(() {
       _showOriginal = false;
       _currentFile = updated;
+      _displayedBytes = _displayedBytes ?? placedBytes;
       _enhancementBaseFile = null;
     });
   }
 
   Future<void> _addText() async {
+    await _addTextAnnotation();
+  }
+
+  Future<void> _addWatermark() async {
+    await _addTextAnnotation(isWatermark: true);
+  }
+
+  Future<void> _addTextAnnotation({bool isWatermark = false}) async {
     final options = await showDialog<TextAnnotationOptions>(
       context: context,
-      builder: (_) => const TextEntryDialog(),
+      builder: (_) => TextEntryDialog(isWatermark: isWatermark),
     );
     if (!context.mounted || options == null || options.text.trim().isEmpty) {
       return;
@@ -351,6 +390,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       builder: (_) => TextPlacementDialog(
         imageBytes: imageBytes,
         options: options,
+        isWatermark: isWatermark,
       ),
     );
     if (!mounted || placedBytes == null || placedBytes.isEmpty) return;
@@ -360,6 +400,37 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     setState(() {
       _showOriginal = false;
       _currentFile = updated;
+      _displayedBytes = _displayedBytes ?? placedBytes;
+      _enhancementBaseFile = null;
+    });
+  }
+
+  Future<void> _addImage() async {
+    final selectedImage = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+    );
+    if (!mounted || selectedImage == null) return;
+
+    final source = _showOriginal ? widget.file : _currentFile;
+    final imageBytes = await source.readAsBytes();
+    final overlayBytes = await File(selectedImage.path).readAsBytes();
+    if (!mounted) return;
+
+    final placedBytes = await showDialog<Uint8List>(
+      context: context,
+      builder: (_) => ImagePlacementDialog(
+        imageBytes: imageBytes,
+        overlayBytes: overlayBytes,
+      ),
+    );
+    if (!mounted || placedBytes == null || placedBytes.isEmpty) return;
+
+    final updated = await _persistEditedImage(placedBytes, 'image_overlay');
+    if (!mounted) return;
+    setState(() {
+      _showOriginal = false;
+      _currentFile = updated;
+      _displayedBytes = _displayedBytes ?? placedBytes;
       _enhancementBaseFile = null;
     });
   }
@@ -369,6 +440,40 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     final savedFile = await _persistEditedImage(updatedBytes, 'saved');
     if (!mounted) return;
     Navigator.pop(context, savedFile);
+  }
+
+  Future<void> _recognizeText() async {
+    if (kIsWeb || (!Platform.isAndroid && !Platform.isIOS)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('OCR is available on Android and iOS only.'),
+        ),
+      );
+      return;
+    }
+
+    await _runAction(() async {
+      final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
+      try {
+        final source = _showOriginal ? widget.file : _currentFile;
+        final recognizedText = await recognizer.processImage(
+          InputImage.fromFilePath(source.path),
+        );
+        if (!mounted) return;
+
+        await showDialog<void>(
+          context: context,
+          builder: (_) => OcrTextDialog(text: recognizedText.text),
+        );
+      } catch (error) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('OCR failed: $error')));
+      } finally {
+        await recognizer.close();
+      }
+    });
   }
 
   Widget _buildEditAction({
@@ -387,11 +492,17 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   Widget build(BuildContext context) {
     final canEdit = _currentFile.existsSync();
     final displayedFile = _showOriginal ? widget.file : _currentFile;
+    final previewBytes = !_showOriginal ? _displayedBytes : null;
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('Edit image'),
         actions: [
+          IconButton(
+            tooltip: 'Recognize text',
+            onPressed: canEdit && !_isBusy ? _recognizeText : null,
+            icon: const Icon(Icons.text_snippet_outlined),
+          ),
           IconButton(
             tooltip: 'Save changes',
             onPressed: canEdit ? _saveImage : null,
@@ -437,6 +548,16 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                       icon: Icons.text_fields,
                       tooltip: 'Text',
                       onPressed: () => _runAction(_addText),
+                    ),
+                    _buildEditAction(
+                      icon: Icons.branding_watermark,
+                      tooltip: 'Watermark',
+                      onPressed: () => _runAction(_addWatermark),
+                    ),
+                    _buildEditAction(
+                      icon: Icons.add_photo_alternate_outlined,
+                      tooltip: 'Add image',
+                      onPressed: () => _runAction(_addImage),
                     ),
                   ];
 
@@ -498,7 +619,9 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                     borderRadius: BorderRadius.circular(18),
                   ),
                   child: canEdit
-                      ? Image.file(displayedFile, fit: BoxFit.contain)
+                      ? (previewBytes != null
+                            ? Image.memory(previewBytes, fit: BoxFit.contain)
+                            : Image.file(displayedFile, fit: BoxFit.contain))
                       : const Center(child: Text('Image unavailable')),
                 ),
               ),
@@ -516,9 +639,10 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                           min: -50,
                           max: 50,
                           divisions: 100,
-                          onChanged: (value) {
-                            setState(() => _brightness = value.round());
-                          },
+                          onChanged: _isBusy
+                              ? null
+                              : (value) =>
+                                    setState(() => _brightness = value.round()),
                           onChangeEnd: (_) async {
                             if (_showOriginal || _isBusy || !mounted) return;
                             await _runAction(_applyEnhancement);
@@ -536,9 +660,10 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                           min: -50,
                           max: 50,
                           divisions: 100,
-                          onChanged: (value) {
-                            setState(() => _contrast = value.round());
-                          },
+                          onChanged: _isBusy
+                              ? null
+                              : (value) =>
+                                    setState(() => _contrast = value.round()),
                           onChangeEnd: (_) async {
                             if (_showOriginal || _isBusy || !mounted) return;
                             await _runAction(_applyEnhancement);
@@ -557,6 +682,45 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   }
 }
 
+class OcrTextDialog extends StatelessWidget {
+  final String text;
+
+  const OcrTextDialog({required this.text, super.key});
+
+  Future<void> _copyText(BuildContext context) async {
+    if (text.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: text));
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Text copied.')));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Recognized text'),
+      content: SizedBox(
+        width: 420,
+        height: 300,
+        child: text.trim().isEmpty
+            ? const Center(child: Text('No text was found in this image.'))
+            : SingleChildScrollView(child: SelectableText(text)),
+      ),
+      actions: [
+        TextButton(
+          onPressed: text.trim().isEmpty ? null : () => _copyText(context),
+          child: const Text('Copy'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Close'),
+        ),
+      ],
+    );
+  }
+}
+
 class SignatureDialog extends StatefulWidget {
   const SignatureDialog({super.key});
 
@@ -567,19 +731,29 @@ class SignatureDialog extends StatefulWidget {
 class _SignatureDialogState extends State<SignatureDialog> {
   final List<Offset?> _points = <Offset?>[];
   final GlobalKey _canvasKey = GlobalKey();
+  bool _isApplying = false;
 
   Future<void> _apply() async {
-    if (_points.whereType<Offset>().length < 2) return;
+    if (_isApplying || _points.whereType<Offset>().length < 2) return;
+    setState(() => _isApplying = true);
 
-    final boundary = _canvasKey.currentContext?.findRenderObject()
-        as RenderRepaintBoundary?;
-    if (boundary == null) return;
+    try {
+      final boundary =
+          _canvasKey.currentContext?.findRenderObject()
+              as RenderRepaintBoundary?;
+      if (boundary == null) return;
 
-    final image = await boundary.toImage(pixelRatio: 3);
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-    image.dispose();
-    if (!mounted || byteData == null) return;
-    Navigator.pop(context, byteData.buffer.asUint8List());
+      final image = await boundary.toImage(pixelRatio: 3);
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
+      if (!mounted || byteData == null) return;
+      if (!mounted) return;
+      Navigator.pop(context, byteData.buffer.asUint8List());
+    } finally {
+      if (mounted) {
+        setState(() => _isApplying = false);
+      }
+    }
   }
 
   @override
@@ -622,7 +796,19 @@ class _SignatureDialogState extends State<SignatureDialog> {
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
-        FilledButton(onPressed: _apply, child: const Text('Apply')),
+        FilledButton(
+          onPressed: _isApplying ? null : _apply,
+          child: _isApplying
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                )
+              : const Text('Apply'),
+        ),
       ],
     );
   }
@@ -678,6 +864,7 @@ class _SignaturePlacementDialogState extends State<SignaturePlacementDialog> {
   double _leftFraction = 0.58;
   double _topFraction = 0.72;
   double _widthFraction = 0.35;
+  bool _isApplying = false;
 
   @override
   void initState() {
@@ -742,9 +929,10 @@ class _SignaturePlacementDialogState extends State<SignaturePlacementDialog> {
     final signature = _signature;
     if (image == null || signature == null) return;
     final nextWidth = _widthFraction + details.delta.dx / imageRect.width;
-    final nextHeight = nextWidth *
-      (image.width / image.height) /
-      (signature.width / signature.height);
+    final nextHeight =
+        nextWidth *
+        (image.width / image.height) /
+        (signature.width / signature.height);
     if (nextHeight >= 0.1 && nextHeight <= 0.85) {
       setState(() {
         _widthFraction = nextWidth.clamp(0.1, 0.85).toDouble();
@@ -761,22 +949,28 @@ class _SignaturePlacementDialogState extends State<SignaturePlacementDialog> {
   Future<void> _apply() async {
     final image = _image;
     final signature = _signature;
-    if (image == null || signature == null) return;
+    if (_isApplying || image == null || signature == null) return;
+    setState(() => _isApplying = true);
 
-    final targetWidth = (image.width * _widthFraction).round().clamp(
-      1,
-      image.width,
-    );
-    final resizedSignature = img.copyResize(signature, width: targetWidth);
-    final targetX = (image.width * _leftFraction).round();
-    final targetY = (image.height * _topFraction).round();
-    img.compositeImage(
-      image,
-      resizedSignature,
-      dstX: targetX,
-      dstY: targetY,
-    );
-    Navigator.pop(context, Uint8List.fromList(img.encodeJpg(image, quality: 100)));
+    try {
+      final targetWidth = (image.width * _widthFraction).round().clamp(
+        1,
+        image.width,
+      );
+      final resizedSignature = img.copyResize(signature, width: targetWidth);
+      final targetX = (image.width * _leftFraction).round();
+      final targetY = (image.height * _topFraction).round();
+      img.compositeImage(image, resizedSignature, dstX: targetX, dstY: targetY);
+      if (!mounted) return;
+      Navigator.pop(
+        context,
+        Uint8List.fromList(img.encodeJpg(image, quality: 100)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isApplying = false);
+      }
+    }
   }
 
   @override
@@ -801,7 +995,10 @@ class _SignaturePlacementDialogState extends State<SignaturePlacementDialog> {
         height: 360,
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final canvasSize = Size(constraints.maxWidth, constraints.maxHeight);
+            final canvasSize = Size(
+              constraints.maxWidth,
+              constraints.maxHeight,
+            );
             final imageRect = _imageRect(canvasSize);
             final signatureRect = _signatureRect(imageRect);
             return Stack(
@@ -859,7 +1056,260 @@ class _SignaturePlacementDialogState extends State<SignaturePlacementDialog> {
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
-        FilledButton(onPressed: _apply, child: const Text('Apply')),
+        FilledButton(
+          onPressed: _isApplying ? null : _apply,
+          child: _isApplying
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                )
+              : const Text('Apply'),
+        ),
+      ],
+    );
+  }
+}
+
+class ImagePlacementDialog extends StatefulWidget {
+  final Uint8List imageBytes;
+  final Uint8List overlayBytes;
+
+  const ImagePlacementDialog({
+    required this.imageBytes,
+    required this.overlayBytes,
+    super.key,
+  });
+
+  @override
+  State<ImagePlacementDialog> createState() => _ImagePlacementDialogState();
+}
+
+class _ImagePlacementDialogState extends State<ImagePlacementDialog> {
+  late final img.Image? _image;
+  late final img.Image? _overlay;
+  double _leftFraction = 0.36;
+  double _topFraction = 0.36;
+  double _widthFraction = 0.28;
+  bool _isApplying = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _image = img.decodeImage(widget.imageBytes);
+    _overlay = img.decodeImage(widget.overlayBytes);
+    final image = _image;
+    final overlay = _overlay;
+    if (image != null && overlay != null) {
+      final maximumWidth =
+          0.8 * (overlay.width / overlay.height) / (image.width / image.height);
+      if (maximumWidth < _widthFraction) _widthFraction = maximumWidth;
+      _leftFraction = (1 - _widthFraction) / 2;
+      _topFraction = (1 - _overlayHeightFraction()) / 2;
+    }
+  }
+
+  Rect _imageRect(Size size) {
+    final image = _image;
+    if (image == null) return Rect.zero;
+    final fitted = applyBoxFit(
+      BoxFit.contain,
+      Size(image.width.toDouble(), image.height.toDouble()),
+      size,
+    );
+    final destination = fitted.destination;
+    return Rect.fromLTWH(
+      (size.width - destination.width) / 2,
+      (size.height - destination.height) / 2,
+      destination.width,
+      destination.height,
+    );
+  }
+
+  double _overlayHeightFraction() {
+    final image = _image;
+    final overlay = _overlay;
+    if (image == null || overlay == null) return 0;
+    return _widthFraction *
+        (image.width / image.height) /
+        (overlay.width / overlay.height);
+  }
+
+  Rect _overlayRect(Rect imageRect) {
+    final overlay = _overlay;
+    if (overlay == null) return Rect.zero;
+    final width = imageRect.width * _widthFraction;
+    final height = width * overlay.height / overlay.width;
+    return Rect.fromLTWH(
+      imageRect.left + imageRect.width * _leftFraction,
+      imageRect.top + imageRect.height * _topFraction,
+      width,
+      height,
+    );
+  }
+
+  void _moveOverlay(DragUpdateDetails details, Rect imageRect) {
+    final heightFraction = _overlayHeightFraction();
+    setState(() {
+      _leftFraction = (_leftFraction + details.delta.dx / imageRect.width)
+          .clamp(0.0, 1.0 - _widthFraction)
+          .toDouble();
+      _topFraction = (_topFraction + details.delta.dy / imageRect.height)
+          .clamp(0.0, 1.0 - heightFraction)
+          .toDouble();
+    });
+  }
+
+  void _resizeOverlay(DragUpdateDetails details, Rect imageRect) {
+    final image = _image;
+    final overlay = _overlay;
+    if (image == null || overlay == null || imageRect.isEmpty) return;
+    final imageAspect = image.width / image.height;
+    final overlayAspect = overlay.width / overlay.height;
+    final maximumWidth = (0.9 * overlayAspect / imageAspect).clamp(0.001, 0.9);
+    final nextWidth = (_widthFraction + details.delta.dx / imageRect.width)
+        .clamp(maximumWidth < 0.08 ? maximumWidth : 0.08, maximumWidth)
+        .toDouble();
+    setState(() {
+      _widthFraction = nextWidth;
+      _leftFraction = _leftFraction.clamp(0.0, 1.0 - nextWidth).toDouble();
+      _topFraction = _topFraction
+          .clamp(0.0, 1.0 - _overlayHeightFraction())
+          .toDouble();
+    });
+  }
+
+  Future<void> _apply() async {
+    final image = _image;
+    final overlay = _overlay;
+    if (_isApplying || image == null || overlay == null) return;
+    setState(() => _isApplying = true);
+
+    try {
+      final targetWidth = (image.width * _widthFraction).round().clamp(
+        1,
+        image.width,
+      );
+      final resizedOverlay = img.copyResize(overlay, width: targetWidth);
+      final targetX = (image.width * _leftFraction).round().clamp(
+        0,
+        image.width - resizedOverlay.width,
+      );
+      final targetY = (image.height * _topFraction).round().clamp(
+        0,
+        image.height - resizedOverlay.height,
+      );
+      img.compositeImage(image, resizedOverlay, dstX: targetX, dstY: targetY);
+      if (!mounted) return;
+      Navigator.pop(
+        context,
+        Uint8List.fromList(img.encodeJpg(image, quality: 100)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isApplying = false);
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_image == null || _overlay == null) {
+      return AlertDialog(
+        title: const Text('Place image'),
+        content: const Text('The selected image could not be read.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      );
+    }
+
+    return AlertDialog(
+      title: const Text('Place image'),
+      content: SizedBox(
+        width: 360,
+        height: 360,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final imageRect = _imageRect(
+              Size(constraints.maxWidth, constraints.maxHeight),
+            );
+            final overlayRect = _overlayRect(imageRect);
+            return Stack(
+              children: [
+                Positioned.fill(
+                  child: ColoredBox(
+                    color: Colors.black12,
+                    child: Image.memory(widget.imageBytes, fit: BoxFit.contain),
+                  ),
+                ),
+                Positioned.fromRect(
+                  rect: overlayRect,
+                  child: GestureDetector(
+                    key: const ValueKey('image-overlay'),
+                    behavior: HitTestBehavior.opaque,
+                    onPanUpdate: (details) => _moveOverlay(details, imageRect),
+                    child: Stack(
+                      clipBehavior: Clip.none,
+                      children: [
+                        Positioned.fill(
+                          child: Image.memory(
+                            widget.overlayBytes,
+                            fit: BoxFit.fill,
+                          ),
+                        ),
+                        Positioned(
+                          right: -10,
+                          bottom: -10,
+                          child: GestureDetector(
+                            key: const ValueKey('image-overlay-resize'),
+                            behavior: HitTestBehavior.opaque,
+                            onPanUpdate: (details) =>
+                                _resizeOverlay(details, imageRect),
+                            child: const CircleAvatar(
+                              radius: 12,
+                              backgroundColor: Colors.indigo,
+                              child: Icon(
+                                Icons.open_in_full,
+                                size: 14,
+                                color: Colors.white,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _isApplying ? null : _apply,
+          child: _isApplying
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                )
+              : const Text('Apply'),
+        ),
       ],
     );
   }
@@ -888,7 +1338,9 @@ class TextAnnotationOptions {
 }
 
 class TextEntryDialog extends StatefulWidget {
-  const TextEntryDialog({super.key});
+  final bool isWatermark;
+
+  const TextEntryDialog({this.isWatermark = false, super.key});
 
   @override
   State<TextEntryDialog> createState() => _TextEntryDialogState();
@@ -903,6 +1355,16 @@ class _TextEntryDialogState extends State<TextEntryDialog> {
   bool _italic = false;
   TextAlign _alignment = TextAlign.left;
   double _opacity = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.isWatermark) {
+      _controller.text = 'WATERMARK';
+      _opacity = 0.35;
+      _alignment = TextAlign.center;
+    }
+  }
 
   static const _colors = <Color>[
     Colors.black,
@@ -930,7 +1392,7 @@ class _TextEntryDialogState extends State<TextEntryDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Add text'),
+      title: Text(widget.isWatermark ? 'Add watermark' : 'Add text'),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -980,7 +1442,8 @@ class _TextEntryDialogState extends State<TextEntryDialog> {
                 DropdownMenuItem(value: 'serif', child: Text('Serif')),
                 DropdownMenuItem(value: 'monospace', child: Text('Monospace')),
               ],
-              onChanged: (value) => setState(() => _fontFamily = value ?? 'Default'),
+              onChanged: (value) =>
+                  setState(() => _fontFamily = value ?? 'Default'),
             ),
             Row(
               children: [
@@ -1018,7 +1481,10 @@ class _TextEntryDialogState extends State<TextEntryDialog> {
               decoration: const InputDecoration(labelText: 'Alignment'),
               items: const [
                 DropdownMenuItem(value: TextAlign.left, child: Text('Left')),
-                DropdownMenuItem(value: TextAlign.center, child: Text('Center')),
+                DropdownMenuItem(
+                  value: TextAlign.center,
+                  child: Text('Center'),
+                ),
                 DropdownMenuItem(value: TextAlign.right, child: Text('Right')),
               ],
               onChanged: (value) =>
@@ -1081,10 +1547,12 @@ class _TextEntryDialogState extends State<TextEntryDialog> {
 class TextPlacementDialog extends StatefulWidget {
   final Uint8List imageBytes;
   final TextAnnotationOptions options;
+  final bool isWatermark;
 
   const TextPlacementDialog({
     required this.imageBytes,
     required this.options,
+    this.isWatermark = false,
     super.key,
   });
 
@@ -1097,12 +1565,17 @@ class _TextPlacementDialogState extends State<TextPlacementDialog> {
   double _leftFraction = 0.08;
   double _topFraction = 0.08;
   late double _fontFraction;
+  bool _isApplying = false;
 
   @override
   void initState() {
     super.initState();
     _image = img.decodeImage(widget.imageBytes);
     _fontFraction = widget.options.fontSize / 600;
+    if (widget.isWatermark) {
+      _leftFraction = 0.1;
+      _topFraction = 0.42;
+    }
   }
 
   Rect _imageRect(Size size) {
@@ -1132,9 +1605,7 @@ class _TextPlacementDialogState extends State<TextPlacementDialog> {
           fontFamily: widget.options.fontFamily == 'Default'
               ? null
               : widget.options.fontFamily,
-          fontWeight: widget.options.bold
-              ? FontWeight.bold
-              : FontWeight.normal,
+          fontWeight: widget.options.bold ? FontWeight.bold : FontWeight.normal,
           fontStyle: widget.options.italic
               ? FontStyle.italic
               : FontStyle.normal,
@@ -1164,21 +1635,26 @@ class _TextPlacementDialogState extends State<TextPlacementDialog> {
   void _moveText(DragUpdateDetails details, Rect imageRect, Rect textRect) {
     setState(() {
       _leftFraction = (_leftFraction + details.delta.dx / imageRect.width)
-          .clamp(0.0, ((imageRect.right - textRect.width - imageRect.left) /
-                  imageRect.width)
-              .clamp(0.0, 1.0))
+          .clamp(
+            0.0,
+            ((imageRect.right - textRect.width - imageRect.left) /
+                    imageRect.width)
+                .clamp(0.0, 1.0),
+          )
           .toDouble();
       _topFraction = (_topFraction + details.delta.dy / imageRect.height)
-          .clamp(0.0, ((imageRect.bottom - textRect.height - imageRect.top) /
-                  imageRect.height)
-              .clamp(0.0, 1.0))
+          .clamp(
+            0.0,
+            ((imageRect.bottom - textRect.height - imageRect.top) /
+                    imageRect.height)
+                .clamp(0.0, 1.0),
+          )
           .toDouble();
     });
   }
 
   void _resizeText(DragUpdateDetails details, Rect imageRect) {
-    final nextFontFraction =
-        _fontFraction + details.delta.dx / imageRect.width;
+    final nextFontFraction = _fontFraction + details.delta.dx / imageRect.width;
     if (nextFontFraction < 0.03 || nextFontFraction > 0.2) return;
     setState(() => _fontFraction = nextFontFraction);
   }
@@ -1201,27 +1677,38 @@ class _TextPlacementDialogState extends State<TextPlacementDialog> {
 
   Future<void> _apply() async {
     final image = _image;
-    if (image == null) return;
-    final textBytes = await _renderText(image.width);
-    if (!mounted || textBytes == null) return;
-    final textImage = img.decodeImage(textBytes);
-    if (textImage == null) return;
+    if (_isApplying || image == null) return;
+    setState(() => _isApplying = true);
 
-    img.compositeImage(
-      image,
-      textImage,
-      dstX: (image.width * _leftFraction).round(),
-      dstY: (image.height * _topFraction).round(),
-    );
-    if (!mounted) return;
-    Navigator.pop(context, Uint8List.fromList(img.encodeJpg(image, quality: 100)));
+    try {
+      final textBytes = await _renderText(image.width);
+      if (!mounted || textBytes == null) return;
+      final textImage = img.decodeImage(textBytes);
+      if (textImage == null) return;
+
+      img.compositeImage(
+        image,
+        textImage,
+        dstX: (image.width * _leftFraction).round(),
+        dstY: (image.height * _topFraction).round(),
+      );
+      if (!mounted) return;
+      Navigator.pop(
+        context,
+        Uint8List.fromList(img.encodeJpg(image, quality: 100)),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => _isApplying = false);
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     if (_image == null) {
       return AlertDialog(
-        title: const Text('Place text'),
+        title: Text(widget.isWatermark ? 'Place watermark' : 'Place text'),
         content: const Text('The image could not be read.'),
         actions: [
           TextButton(
@@ -1233,13 +1720,16 @@ class _TextPlacementDialogState extends State<TextPlacementDialog> {
     }
 
     return AlertDialog(
-      title: const Text('Place text'),
+      title: Text(widget.isWatermark ? 'Place watermark' : 'Place text'),
       content: SizedBox(
         width: 360,
         height: 360,
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final canvasSize = Size(constraints.maxWidth, constraints.maxHeight);
+            final canvasSize = Size(
+              constraints.maxWidth,
+              constraints.maxHeight,
+            );
             final imageRect = _imageRect(canvasSize);
             final textRect = _textRect(imageRect);
             return Stack(
@@ -1314,7 +1804,19 @@ class _TextPlacementDialogState extends State<TextPlacementDialog> {
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
-        FilledButton(onPressed: _apply, child: const Text('Apply')),
+        FilledButton(
+          onPressed: _isApplying ? null : _apply,
+          child: _isApplying
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: Colors.white,
+                  ),
+                )
+              : const Text('Apply'),
+        ),
       ],
     );
   }
@@ -1407,6 +1909,35 @@ class StorageService {
       ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
   }
 
+  Stream<List<DocumentFolder>> documentBatches({int batchSize = 12}) async* {
+    final rootDirectory = await root();
+    final batch = <DocumentFolder>[];
+
+    await for (final entity in rootDirectory.list()) {
+      if (entity is! Directory) continue;
+
+      final document = DocumentFolder(entity);
+      if (document.images.isEmpty && !document.pdfFile.existsSync()) continue;
+
+      batch.add(document);
+      if (batch.length < batchSize) continue;
+
+      batch.sort(
+        (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+      );
+      yield List<DocumentFolder>.from(batch);
+      batch.clear();
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    if (batch.isNotEmpty) {
+      batch.sort(
+        (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+      );
+      yield List<DocumentFolder>.from(batch);
+    }
+  }
+
   Future<DocumentFolder> createDocument() async {
     final rootDirectory = await root();
     final names = rootDirectory
@@ -1424,7 +1955,11 @@ class StorageService {
     return DocumentFolder(directory);
   }
 
-  Future<DocumentFolder> importFile(File source, String originalName) async {
+  Future<DocumentFolder> importFile(
+    File source,
+    String originalName, {
+    void Function(int)? onProgress,
+  }) async {
     final extension = path.extension(originalName).toLowerCase();
     final supportedImageExtensions = ['.jpg', '.jpeg', '.png', '.heic'];
     if (extension != '.pdf' && !supportedImageExtensions.contains(extension)) {
@@ -1437,9 +1972,10 @@ class StorageService {
 
     try {
       if (extension == '.pdf') {
-        await _importPdfPages(source, document);
+        await _importPdfPages(source, document, onProgress: onProgress);
       } else {
         await source.copy(path.join(document.directory.path, '1$extension'));
+        onProgress?.call(100);
       }
     } catch (_) {
       await document.directory.delete(recursive: true);
@@ -1449,13 +1985,19 @@ class StorageService {
     return document;
   }
 
-  Future<void> _importPdfPages(File source, DocumentFolder document) async {
+  Future<void> _importPdfPages(
+    File source,
+    DocumentFolder document, {
+    void Function(int)? onProgress,
+  }) async {
     final pdfFile = await source.copy(document.pdfFile.path);
     final pdfDocument = await PdfDocument.openFile(pdfFile.path);
     try {
-      for (var pageNumber = 1;
-          pageNumber <= pdfDocument.pagesCount;
-          pageNumber++) {
+      for (
+        var pageNumber = 1;
+        pageNumber <= pdfDocument.pagesCount;
+        pageNumber++
+      ) {
         final page = await pdfDocument.getPage(pageNumber);
         try {
           final width = 1600.0;
@@ -1475,6 +2017,9 @@ class StorageService {
             path.join(document.directory.path, '$pageNumber.jpg'),
           );
           await imageFile.writeAsBytes(rendered.bytes);
+          onProgress?.call(
+            (pageNumber * 100 / pdfDocument.pagesCount).round(),
+          );
         } finally {
           await page.close();
         }
@@ -1515,10 +2060,16 @@ class StorageService {
 
     final winner = selectedDocuments.first;
     final losers = selectedDocuments.skip(1).toList();
-    var nextIndex = winner.images
-            .map((file) => int.tryParse(path.basenameWithoutExtension(file.path)))
+    var nextIndex =
+        winner.images
+            .map(
+              (file) => int.tryParse(path.basenameWithoutExtension(file.path)),
+            )
             .whereType<int>()
-            .fold<int>(0, (highest, value) => value > highest ? value : highest) +
+            .fold<int>(
+              0,
+              (highest, value) => value > highest ? value : highest,
+            ) +
         1;
     final copiedFiles = <File>[];
 
@@ -1577,8 +2128,8 @@ class _HomePageState extends State<HomePage> {
     final filtered = query.isEmpty
         ? List<DocumentFolder>.from(documents)
         : documents
-        .where((document) => document.name.toLowerCase().contains(query))
-        .toList();
+              .where((document) => document.name.toLowerCase().contains(query))
+              .toList();
     filtered.sort((a, b) {
       final comparison = switch (_sortField) {
         'created' => a.createdDate.compareTo(b.createdDate),
@@ -1639,10 +2190,17 @@ class _HomePageState extends State<HomePage> {
                 decoration: const InputDecoration(labelText: 'Sort by'),
                 items: const [
                   DropdownMenuItem(value: 'name', child: Text('Name')),
-                  DropdownMenuItem(value: 'created', child: Text('Created date')),
-                  DropdownMenuItem(value: 'modified', child: Text('Modified date')),
+                  DropdownMenuItem(
+                    value: 'created',
+                    child: Text('Created date'),
+                  ),
+                  DropdownMenuItem(
+                    value: 'modified',
+                    child: Text('Modified date'),
+                  ),
                 ],
-                onChanged: (value) => setDialogState(() => field = value ?? 'name'),
+                onChanged: (value) =>
+                    setDialogState(() => field = value ?? 'name'),
               ),
               const SizedBox(height: 12),
               SegmentedButton<bool>(
@@ -1700,10 +2258,27 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _refresh() async {
-    if (mounted && documents.isEmpty) setState(() => loading = true);
+    final isInitialLoad = documents.isEmpty;
+    if (mounted && isInitialLoad) {
+      setState(() => loading = true);
+    }
+
     try {
-      await storage.root();
-      documents = await storage.documents();
+      final loadedDocuments = <DocumentFolder>[];
+      await for (final batch in storage.documentBatches()) {
+        loadedDocuments.addAll(batch);
+        if (!mounted) return;
+        setState(() {
+          documents = List<DocumentFolder>.from(loadedDocuments);
+          loading = false;
+        });
+      }
+
+      if (!mounted) return;
+      setState(() {
+        documents = loadedDocuments;
+        loading = false;
+      });
     } catch (error) {
       _message('Storage could not be prepared: $error');
     } finally {
@@ -1721,6 +2296,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _importIncomingFile() async {
+    var progressDialogShown = false;
     try {
       final incoming = await _openWithChannel.invokeMethod<Object?>(
         'getIncomingFile',
@@ -1729,25 +2305,52 @@ class _HomePageState extends State<HomePage> {
       final sources = incoming is Map
           ? <Map<Object?, Object?>>[incoming.cast<Object?, Object?>()]
           : (incoming is List
-            ? incoming
-              .whereType<Map>()
-              .map((file) => file.cast<Object?, Object?>())
-              .toList()
-            : <Map<Object?, Object?>>[]);
-      for (final file in sources) {
+                ? incoming
+                      .whereType<Map>()
+                      .map((file) => file.cast<Object?, Object?>())
+                      .toList()
+                : <Map<Object?, Object?>>[]);
+      if (sources.isEmpty) return;
+
+      showGeneratingDialog(context, message: 'Importing...');
+      progressDialogShown = true;
+      DocumentFolder? importedDocument;
+      for (var index = 0; index < sources.length; index++) {
+        final file = sources[index];
         final sourcePath = file['path'] as String?;
         if (sourcePath == null) continue;
         final source = File(sourcePath);
         final name = file['name'] as String? ?? 'Document';
-        await storage.importFile(source, name);
+        final document = await storage.importFile(
+          source,
+          name,
+          onProgress: (progress) {
+            _generatingProgress.value =
+                ((index * 100 + progress) / sources.length).round();
+          },
+        );
+        importedDocument ??= document;
         await source.delete();
       }
-      await _refresh();
+      _generatingProgress.value = 100;
+      if (progressDialogShown && mounted) {
+        hideGeneratingDialog(context);
+        progressDialogShown = false;
+      }
       _message('Document imported.');
+      if (importedDocument != null && mounted) {
+        await _openDocument(importedDocument);
+      } else {
+        await _refresh();
+      }
     } on PlatformException catch (error) {
       _message('Could not open document: ${error.message ?? error.code}');
     } catch (error) {
       _message('Could not import document: $error');
+    } finally {
+      if (progressDialogShown && mounted) {
+        hideGeneratingDialog(context);
+      }
     }
   }
 
@@ -1852,7 +2455,7 @@ class _HomePageState extends State<HomePage> {
           ),
           FilledButton(
             onPressed: () => Navigator.pop(dialogContext, controller.text),
-            child: const Text('Rename'),
+            child: const Text('Save'),
           ),
         ],
       ),
@@ -1969,10 +2572,12 @@ class _HomePageState extends State<HomePage> {
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
                       initialValue: fileSize,
-                      decoration: const InputDecoration(labelText: 'File Size'),
-                      items: buildExportSizeItems(
-                        documentTotalBytes(_selectedDocuments.toList()),
+                      decoration: InputDecoration(
+                        labelText: fileType == 'pdf'
+                            ? 'PDF output size'
+                            : 'JPG output size',
                       ),
+                      items: buildExportSizeItems(),
                       onChanged: (value) =>
                           setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
@@ -2132,10 +2737,7 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-  Widget _buildGridDocumentCard(
-    BuildContext context,
-    DocumentFolder document,
-  ) {
+  Widget _buildGridDocumentCard(BuildContext context, DocumentFolder document) {
     final selected = _selectedDocuments.contains(document);
     final firstImage = document.images.firstOrNull;
     return InkWell(
@@ -2159,7 +2761,10 @@ class _HomePageState extends State<HomePage> {
                   gradient: LinearGradient(
                     begin: Alignment.topCenter,
                     end: Alignment.bottomCenter,
-                    colors: [Colors.transparent, Colors.black.withValues(alpha: 0.8)],
+                    colors: [
+                      Colors.transparent,
+                      Colors.black.withValues(alpha: 0.8),
+                    ],
                   ),
                 ),
               ),
@@ -2201,324 +2806,325 @@ class _HomePageState extends State<HomePage> {
     final isNarrowLayout = MediaQuery.sizeOf(context).width < 500;
 
     return Scaffold(
-    appBar: AppBar(
-      title: _searchOpen
-          ? SizedBox(
-              width: 220,
-              child: TextField(
-                controller: _searchController,
-                autofocus: true,
-                onChanged: (value) {
-                  setState(() => _searchQuery = value);
-                },
-                decoration: const InputDecoration(
-                  hintText: 'Search docs',
-                  border: InputBorder.none,
-                  isDense: true,
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-            )
-          : _isMultiSelectMode
-          ? Text('${_selectedDocuments.length} selected')
-          : Text('My Docs (${documents.length})'),
-      leading: _isMultiSelectMode
-          ? IconButton(
-              onPressed: _clearSelection,
-              icon: const Icon(Icons.close),
-              tooltip: 'Clear selection',
-            )
-          : null,
-      actions: [
-        if (!_isMultiSelectMode)
-          IconButton(
-            onPressed: _toggleSearch,
-            icon: Icon(_searchOpen ? Icons.close : Icons.search),
-            tooltip: 'Search documents',
-          ),
-        if (!_isMultiSelectMode)
-          PopupMenuButton<String>(
-            tooltip: 'Document options',
-            onSelected: (value) {
-              if (value == 'sort') _showSortDialog();
-              if (value == 'view') _toggleGridView();
-            },
-            itemBuilder: (_) => [
-              const PopupMenuItem(
-                value: 'sort',
-                child: ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(Icons.sort),
-                  title: Text('Sort'),
-                ),
-              ),
-              PopupMenuItem(
-                value: 'view',
-                child: ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(_gridView ? Icons.view_list : Icons.grid_view),
-                  title: Text(_gridView ? 'View as list' : 'View as grid'),
-                ),
-              ),
-            ],
-          ),
-      ],
-    ),
-    floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
-    floatingActionButton: _isMultiSelectMode
-        ? null
-        : Padding(
-            padding: const EdgeInsets.only(bottom: 12),
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                borderRadius: BorderRadius.circular(18),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.12),
-                    blurRadius: 12,
-                    offset: const Offset(0, 4),
+      appBar: AppBar(
+        title: _searchOpen
+            ? SizedBox(
+                width: 220,
+                child: TextField(
+                  controller: _searchController,
+                  autofocus: true,
+                  onChanged: (value) {
+                    setState(() => _searchQuery = value);
+                  },
+                  decoration: const InputDecoration(
+                    hintText: 'Search docs',
+                    border: InputBorder.none,
+                    isDense: true,
+                    contentPadding: EdgeInsets.zero,
                   ),
-                ],
-              ),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    FilledButton.icon(
-                      onPressed: () =>
-                          _addToNewDocument(ImageSource.camera),
-                      icon: const Icon(Icons.camera_alt, size: 18),
-                      label: const Text('Camera'),
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size(0, 42),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    FilledButton.icon(
-                      onPressed: () => _addToNewDocument(ImageSource.gallery),
-                      icon: const Icon(Icons.photo_library, size: 18),
-                      label: const Text('Gallery'),
-                      style: FilledButton.styleFrom(
-                        minimumSize: const Size(0, 42),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 10,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                      ),
-                    ),
-                  ],
                 ),
-              ),
+              )
+            : _isMultiSelectMode
+            ? Text('${_selectedDocuments.length} selected')
+            : Text('My Docs (${documents.length})'),
+        leading: _isMultiSelectMode
+            ? IconButton(
+                onPressed: _clearSelection,
+                icon: const Icon(Icons.close),
+                tooltip: 'Clear selection',
+              )
+            : null,
+        actions: [
+          if (!_isMultiSelectMode)
+            IconButton(
+              onPressed: _toggleSearch,
+              icon: Icon(_searchOpen ? Icons.close : Icons.search),
+              tooltip: 'Search documents',
             ),
-          ),
-    body: SafeArea(
-      top: false,
-      child: Stack(
-        children: [
-          RefreshIndicator(
-            onRefresh: _refresh,
-            child: loading
-                ? const Center(child: CircularProgressIndicator())
-                : _filteredDocuments.isEmpty
-                ? ListView(
-                    children: [
-                      const SizedBox(height: 220),
-                      Center(
-                        child: Text(
-                          _searchQuery.isEmpty
-                              ? 'No files yet. Tap Camera or Gallery to start scanning.'
-                              : 'No documents match "$_searchQuery".',
-                        ),
-                      ),
-                    ],
-                  )
-                : _gridView
-                ? GridView.builder(
-                    padding: EdgeInsets.fromLTRB(
-                      16,
-                      16,
-                      16,
-                      _isMultiSelectMode
-                          ? (isNarrowLayout ? 100 : 120)
-                          : 100,
-                    ),
-                    gridDelegate:
-                        const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 3,
-                          crossAxisSpacing: 8,
-                          mainAxisSpacing: 8,
-                          childAspectRatio: 0.75,
-                        ),
-                    itemCount: _filteredDocuments.length,
-                    itemBuilder: (context, index) => _buildGridDocumentCard(
-                      context,
-                      _filteredDocuments[index],
-                    ),
-                  )
-                : ListView.separated(
-                    padding: EdgeInsets.fromLTRB(
-                      16,
-                      16,
-                      16,
-                      _isMultiSelectMode
-                          ? (isNarrowLayout ? 100 : 120)
-                          : 100,
-                    ),
-                    itemCount: _filteredDocuments.length,
-                    separatorBuilder: (_, _) => const SizedBox(height: 8),
-                    itemBuilder: (context, index) {
-                      final document = _filteredDocuments[index];
-                      final selected = _selectedDocuments.contains(document);
-                      final firstImage = document.images.firstOrNull;
-                      return ListTile(
-                        tileColor: Theme.of(
-                          context,
-                        ).colorScheme.surfaceContainerHighest,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        leading: _isMultiSelectMode
-                            ? Checkbox(
-                                value: selected,
-                                onChanged: (_) =>
-                                    _toggleDocumentSelection(document),
-                              )
-                            : firstImage == null
-                            ? const Icon(Icons.folder_outlined)
-                            : ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.file(
-                                  firstImage,
-                                  width: 48,
-                                  height: 48,
-                                  fit: BoxFit.cover,
-                                ),
-                              ),
-                        title: Text(
-                          document.name,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Text(
-                          '${document.images.length} picture${document.images.length == 1 ? '' : 's'}',
-                        ),
-                        onTap: _isMultiSelectMode
-                            ? () => _toggleDocumentSelection(document)
-                            : () => _openDocument(document),
-                        onLongPress: () => _toggleDocumentSelection(document),
-                        trailing: _isMultiSelectMode
-                            ? null
-                            : IconButton(
-                                icon: const Icon(Icons.more_vert),
-                                onPressed: () => _menu(document),
-                              ),
-                      );
-                    },
-                  ),
-          ),
-          if (_isMultiSelectMode)
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surface,
-                  border: Border(
-                    top: BorderSide(color: Theme.of(context).dividerColor),
+          if (!_isMultiSelectMode)
+            PopupMenuButton<String>(
+              tooltip: 'Document options',
+              onSelected: (value) {
+                if (value == 'sort') _showSortDialog();
+                if (value == 'view') _toggleGridView();
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(
+                  value: 'sort',
+                  child: ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(Icons.sort),
+                    title: Text('Sort'),
                   ),
                 ),
-                child: isNarrowLayout
-                    ? Row(
-                        children: [
-                          Expanded(
-                            child: _buildBulkActionButton(
-                              icon: Icons.delete_outline,
-                              label: 'Delete',
-                              vertical: true,
-                              onPressed: _bulkProcessing
-                                  ? null
-                                  : _deleteSelectedDocuments,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: _buildBulkActionButton(
-                              icon: Icons.merge_type,
-                              label: 'Merge',
-                              vertical: true,
-                              onPressed:
-                                  _bulkProcessing ||
-                                      _selectedDocuments.length < 2
-                                  ? null
-                                  : _mergeSelectedDocuments,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: _buildBulkActionButton(
-                              icon: Icons.share,
-                              label: 'Share',
-                              vertical: true,
-                              onPressed: _bulkProcessing
-                                  ? null
-                                  : _shareSelectedDocuments,
-                            ),
-                          ),
-                        ],
-                      )
-                    : Row(
-                        children: [
-                          Expanded(
-                            child: _buildBulkActionButton(
-                              icon: Icons.delete_outline,
-                              label: 'Delete',
-                              onPressed: _bulkProcessing
-                                  ? null
-                                  : _deleteSelectedDocuments,
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: _buildBulkActionButton(
-                              icon: Icons.merge_type,
-                              label: 'Merge',
-                              onPressed:
-                                  _bulkProcessing ||
-                                      _selectedDocuments.length < 2
-                                  ? null
-                                  : _mergeSelectedDocuments,
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: _buildBulkActionButton(
-                              icon: Icons.share,
-                              label: 'Share',
-                              onPressed: _bulkProcessing
-                                  ? null
-                                  : _shareSelectedDocuments,
-                            ),
-                          ),
-                        ],
-                      ),
-              ),
+                PopupMenuItem(
+                  value: 'view',
+                  child: ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: Icon(
+                      _gridView ? Icons.view_list : Icons.grid_view,
+                    ),
+                    title: Text(_gridView ? 'View as list' : 'View as grid'),
+                  ),
+                ),
+              ],
             ),
         ],
       ),
-    ),
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      floatingActionButton: _isMultiSelectMode
+          ? null
+          : Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: DecoratedBox(
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surface,
+                  borderRadius: BorderRadius.circular(18),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.12),
+                      blurRadius: 12,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 8,
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      FilledButton.icon(
+                        onPressed: () => _addToNewDocument(ImageSource.camera),
+                        icon: const Icon(Icons.camera_alt, size: 18),
+                        label: const Text('Camera'),
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(0, 42),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 10,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton.icon(
+                        onPressed: () => _addToNewDocument(ImageSource.gallery),
+                        icon: const Icon(Icons.photo_library, size: 18),
+                        label: const Text('Gallery'),
+                        style: FilledButton.styleFrom(
+                          minimumSize: const Size(0, 42),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 16,
+                            vertical: 10,
+                          ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+      body: SafeArea(
+        top: false,
+        child: Stack(
+          children: [
+            RefreshIndicator(
+              onRefresh: _refresh,
+              child: loading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _filteredDocuments.isEmpty
+                  ? ListView(
+                      children: [
+                        const SizedBox(height: 220),
+                        Center(
+                          child: Text(
+                            _searchQuery.isEmpty
+                                ? 'No files yet. Tap Camera or Gallery to start scanning.'
+                                : 'No documents match "$_searchQuery".',
+                          ),
+                        ),
+                      ],
+                    )
+                  : _gridView
+                  ? GridView.builder(
+                      padding: EdgeInsets.fromLTRB(
+                        16,
+                        16,
+                        16,
+                        _isMultiSelectMode ? (isNarrowLayout ? 100 : 120) : 100,
+                      ),
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 3,
+                            crossAxisSpacing: 8,
+                            mainAxisSpacing: 8,
+                            childAspectRatio: 0.75,
+                          ),
+                      itemCount: _filteredDocuments.length,
+                      itemBuilder: (context, index) => _buildGridDocumentCard(
+                        context,
+                        _filteredDocuments[index],
+                      ),
+                    )
+                  : ListView.separated(
+                      padding: EdgeInsets.fromLTRB(
+                        16,
+                        16,
+                        16,
+                        _isMultiSelectMode ? (isNarrowLayout ? 100 : 120) : 100,
+                      ),
+                      itemCount: _filteredDocuments.length,
+                      separatorBuilder: (_, _) => const SizedBox(height: 8),
+                      itemBuilder: (context, index) {
+                        final document = _filteredDocuments[index];
+                        final selected = _selectedDocuments.contains(document);
+                        final documentImages = document.images;
+                        final firstImage = documentImages.firstOrNull;
+                        return ListTile(
+                          tileColor: Theme.of(
+                            context,
+                          ).colorScheme.surfaceContainerHighest,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          leading: _isMultiSelectMode
+                              ? Checkbox(
+                                  value: selected,
+                                  onChanged: (_) =>
+                                      _toggleDocumentSelection(document),
+                                )
+                              : firstImage == null
+                              ? const Icon(Icons.folder_outlined)
+                              : ClipRRect(
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: Image.file(
+                                    firstImage,
+                                    width: 48,
+                                    height: 48,
+                                    fit: BoxFit.cover,
+                                  ),
+                                ),
+                          title: Text(
+                            document.name,
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                          subtitle: Text(
+                            '${documentImages.length} picture${documentImages.length == 1 ? '' : 's'} • ${formatByteSize(document.sizeBytes)}',
+                          ),
+                          onTap: _isMultiSelectMode
+                              ? () => _toggleDocumentSelection(document)
+                              : () => _openDocument(document),
+                          onLongPress: () => _toggleDocumentSelection(document),
+                          trailing: _isMultiSelectMode
+                              ? null
+                              : IconButton(
+                                  icon: const Icon(Icons.more_vert),
+                                  onPressed: () => _menu(document),
+                                ),
+                        );
+                      },
+                    ),
+            ),
+            if (_isMultiSelectMode)
+              Positioned(
+                left: 0,
+                right: 0,
+                bottom: 0,
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surface,
+                    border: Border(
+                      top: BorderSide(color: Theme.of(context).dividerColor),
+                    ),
+                  ),
+                  child: isNarrowLayout
+                      ? Row(
+                          children: [
+                            Expanded(
+                              child: _buildBulkActionButton(
+                                icon: Icons.delete_outline,
+                                label: 'Delete',
+                                vertical: true,
+                                onPressed: _bulkProcessing
+                                    ? null
+                                    : _deleteSelectedDocuments,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: _buildBulkActionButton(
+                                icon: Icons.merge_type,
+                                label: 'Merge',
+                                vertical: true,
+                                onPressed:
+                                    _bulkProcessing ||
+                                        _selectedDocuments.length < 2
+                                    ? null
+                                    : _mergeSelectedDocuments,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: _buildBulkActionButton(
+                                icon: Icons.share,
+                                label: 'Share',
+                                vertical: true,
+                                onPressed: _bulkProcessing
+                                    ? null
+                                    : _shareSelectedDocuments,
+                              ),
+                            ),
+                          ],
+                        )
+                      : Row(
+                          children: [
+                            Expanded(
+                              child: _buildBulkActionButton(
+                                icon: Icons.delete_outline,
+                                label: 'Delete',
+                                onPressed: _bulkProcessing
+                                    ? null
+                                    : _deleteSelectedDocuments,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: _buildBulkActionButton(
+                                icon: Icons.merge_type,
+                                label: 'Merge',
+                                onPressed:
+                                    _bulkProcessing ||
+                                        _selectedDocuments.length < 2
+                                    ? null
+                                    : _mergeSelectedDocuments,
+                              ),
+                            ),
+                            const SizedBox(width: 12),
+                            Expanded(
+                              child: _buildBulkActionButton(
+                                icon: Icons.share,
+                                label: 'Share',
+                                onPressed: _bulkProcessing
+                                    ? null
+                                    : _shareSelectedDocuments,
+                              ),
+                            ),
+                          ],
+                        ),
+                ),
+              ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -2538,11 +3144,7 @@ class _HomePageState extends State<HomePage> {
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(icon),
-                  const SizedBox(height: 2),
-                  Text(label),
-                ],
+                children: [Icon(icon), const SizedBox(height: 2), Text(label)],
               ),
             )
           : FilledButton.icon(
@@ -2567,16 +3169,6 @@ String sanitizeExportFileName(String rawName, String extension) {
     );
   }
   return normalized;
-}
-
-int documentTotalBytes(List<DocumentFolder> documents) {
-  return documents.fold<int>(0, (sum, document) {
-    return sum +
-        document.images.fold<int>(
-          0,
-          (docSum, file) => docSum + file.lengthSync(),
-        );
-  });
 }
 
 const exportSizeOptions = <String, double>{
@@ -2609,12 +3201,62 @@ String formatByteSize(int bytes) {
   return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
 }
 
-List<DropdownMenuItem<String>> buildExportSizeItems(int actualBytes) =>
-    exportSizeOptions.entries
-        .map(
-          (entry) => DropdownMenuItem(value: entry.key, child: Text(entry.key)),
-        )
-        .toList();
+List<DropdownMenuItem<String>> buildExportSizeItems() => exportSizeOptions
+    .entries
+    .map((entry) => DropdownMenuItem(value: entry.key, child: Text(entry.key)))
+    .toList();
+
+double exportScaleForDimensions({
+  required int width,
+  required int height,
+  required double requestedScale,
+}) {
+  const maxExportDimension = 1800;
+  final longestDimension = width > height ? width : height;
+  final resolutionScale = longestDimension > maxExportDimension
+      ? maxExportDimension / longestDimension
+      : 1.0;
+  return requestedScale.clamp(0.01, 1.0).toDouble() * resolutionScale;
+}
+
+bool shouldKeepOriginalJpegExport({
+  required double scaleFactor,
+  required int quality,
+  required int width,
+  required int height,
+}) {
+  return scaleFactor >= 1.0 &&
+      quality >= 100 &&
+      width <= 1800 &&
+      height <= 1800;
+}
+
+bool shouldEmbedOriginalJpegInPdf({
+  required double scaleFactor,
+  required int quality,
+}) {
+  return scaleFactor >= 1.0 && quality >= 100;
+}
+
+bool shouldRunExportInline({
+  required int imageCount,
+  required String fileType,
+  required double scaleFactor,
+  required int quality,
+}) {
+  final normalizedType = fileType.toLowerCase();
+  final actualQuality = scaleFactor >= 0.95 && quality >= 95;
+
+  if (normalizedType == 'jpg' && imageCount <= 1) {
+    return true;
+  }
+
+  if (imageCount <= 3 && actualQuality) {
+    return true;
+  }
+
+  return false;
+}
 
 Future<File> _generateExportFile({
   required List<File> images,
@@ -2622,18 +3264,106 @@ Future<File> _generateExportFile({
   required File outputFile,
   required double scaleFactor,
   required int quality,
+  void Function(int)? onProgress,
 }) async {
+  final embedsOriginalJpegPages =
+      fileType.toLowerCase() == 'pdf' &&
+      images.length <= 3 &&
+      scaleFactor >= 1.0 &&
+      quality >= 100 &&
+      images.every((file) {
+        final extension = path.extension(file.path).toLowerCase();
+        return extension == '.jpg' || extension == '.jpeg';
+      });
+  final shouldInline =
+      embedsOriginalJpegPages ||
+      shouldRunExportInline(
+        imageCount: images.length,
+        fileType: fileType,
+        scaleFactor: scaleFactor,
+        quality: quality,
+      );
+
+  final progressPort = ReceivePort();
+  final progressSubscription = progressPort.listen((message) {
+    if (message is int) onProgress?.call(message);
+  });
+  final arguments = <String, Object?>{
+      'imagePaths': images.map((image) => image.path).toList(),
+      'fileType': fileType,
+      'outputPath': outputFile.path,
+      'scaleFactor': scaleFactor,
+      'quality': quality,
+      'progressPort': progressPort.sendPort,
+    };
+
+  try {
+    if (shouldInline) {
+      await _generateExportFileInBackground(arguments);
+    } else {
+      await compute<Map<String, Object?>, String>(
+        _generateExportFileInBackground,
+        arguments,
+      );
+    }
+  } finally {
+    await progressSubscription.cancel();
+    progressPort.close();
+  }
+
+  return outputFile;
+}
+
+Future<String> _generateExportFileInBackground(
+  Map<String, Object?> arguments,
+) async {
+  final images = (arguments['imagePaths'] as List<String>)
+      .map(File.new)
+      .toList();
+  final fileType = arguments['fileType'] as String;
+  final outputFile = File(arguments['outputPath'] as String);
+  final scaleFactor = arguments['scaleFactor'] as double;
+  final quality = arguments['quality'] as int;
+  final progressPort = arguments['progressPort'] as SendPort?;
+  void reportProgress(int progress) {
+    progressPort?.send(progress.clamp(0, 100));
+  }
+
   if (images.isEmpty) {
     throw const FormatException('No images available for export');
   }
 
+  reportProgress(1);
+
   if (fileType.toLowerCase() == 'jpg') {
+    if (images.length == 1) {
+      final bytes = await images.single.readAsBytes();
+      if (img.JpegDecoder().isValidFile(bytes)) {
+        final jpeg = pw.MemoryImage(bytes);
+        if (jpeg.width != null &&
+            jpeg.height != null &&
+            shouldKeepOriginalJpegExport(
+              scaleFactor: scaleFactor,
+              quality: quality,
+              width: jpeg.width!,
+              height: jpeg.height!,
+            )) {
+          await outputFile.writeAsBytes(bytes);
+          reportProgress(100);
+          return outputFile.path;
+        }
+      }
+    }
+
     final decodedImages = <img.Image>[];
-    for (final imageFile in images) {
+    for (var index = 0; index < images.length; index++) {
+      final imageFile = images[index];
       final bytes = await imageFile.readAsBytes();
       final decoded = img.decodeImage(bytes);
-      if (decoded == null) continue;
-      decodedImages.add(_scaleExportImage(decoded, scaleFactor));
+      if (decoded != null) {
+        decodedImages.add(_scaleExportImage(decoded, scaleFactor));
+      }
+      reportProgress(5 + ((index + 1) * 80 / images.length).round());
     }
 
     if (decodedImages.isEmpty) {
@@ -2658,27 +3388,43 @@ Future<File> _generateExportFile({
     }
 
     await outputFile.writeAsBytes(img.encodeJpg(combined, quality: quality));
-    return outputFile;
+    reportProgress(100);
+    return outputFile.path;
   }
 
   final pdf = pw.Document();
   final pageFormat = pdf_lib.PdfPageFormat.standard;
 
-  for (final imageFile in images) {
+  for (var index = 0; index < images.length; index++) {
+    final imageFile = images[index];
     final bytes = await imageFile.readAsBytes();
-    final decoded = img.decodeImage(bytes);
-    if (decoded == null) continue;
+    pw.ImageProvider imageProvider;
+    final isActualJpeg = img.JpegDecoder().isValidFile(bytes);
+    if (isActualJpeg) {
+      imageProvider = pw.MemoryImage(
+        shouldEmbedOriginalJpegInPdf(scaleFactor: scaleFactor, quality: quality)
+            ? bytes
+            : _resizeJpegForPdf(
+                bytes,
+                scaleFactor: scaleFactor,
+                quality: quality,
+              ),
+      );
+    } else {
+      final decoded = img.decodeImage(bytes);
+      if (decoded == null) continue;
+      final scaledImage = _scaleExportImage(decoded, scaleFactor);
+      imageProvider = pw.MemoryImage(
+        Uint8List.fromList(img.encodeJpg(scaledImage, quality: quality)),
+      );
+    }
 
-    final scaledImage = _scaleExportImage(decoded, scaleFactor);
-    final scaledBytes = Uint8List.fromList(
-      img.encodeJpg(scaledImage, quality: quality),
-    );
     pdf.addPage(
       pw.Page(
         pageFormat: pageFormat,
         build: (_) => pw.Center(
           child: pw.Image(
-            pw.MemoryImage(scaledBytes),
+            imageProvider,
             fit: pw.BoxFit.contain,
             width: pageFormat.width,
             height: pageFormat.height,
@@ -2686,21 +3432,61 @@ Future<File> _generateExportFile({
         ),
       ),
     );
+    reportProgress(5 + ((index + 1) * 85 / images.length).round());
   }
 
   await outputFile.writeAsBytes(await pdf.save());
-  return outputFile;
+  reportProgress(100);
+  return outputFile.path;
+}
+
+Uint8List _resizeJpegForPdf(
+  Uint8List bytes, {
+  required double scaleFactor,
+  required int quality,
+}) {
+  if (Platform.isAndroid || Platform.isIOS || Platform.isMacOS) {
+    try {
+      final info = bicubic.BicubicResizer.getImageInfo(bytes);
+      final scale = exportScaleForDimensions(
+        width: info.orientedWidth,
+        height: info.orientedHeight,
+        requestedScale: scaleFactor,
+      );
+      final width = (info.orientedWidth * scale).round().clamp(
+        1,
+        info.orientedWidth,
+      );
+      final height = (info.orientedHeight * scale).round().clamp(
+        1,
+        info.orientedHeight,
+      );
+      return bicubic.BicubicResizer.resizeJpeg(
+        jpegBytes: bytes,
+        outputWidth: width,
+        outputHeight: height,
+        quality: quality,
+        cropAspectRatio: bicubic.CropAspectRatio.original,
+      );
+    } catch (_) {
+      // Fall back to the Dart encoder if native processing is unavailable.
+    }
+  }
+
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) {
+    throw const FormatException('Could not decode JPEG image');
+  }
+  final scaledImage = _scaleExportImage(decoded, scaleFactor);
+  return Uint8List.fromList(img.encodeJpg(scaledImage, quality: quality));
 }
 
 img.Image _scaleExportImage(img.Image source, double scaleFactor) {
-  const maxExportDimension = 1800;
-  final requestedScale = scaleFactor.clamp(0.01, 1.0);
-  final dimensionScale =
-      maxExportDimension /
-      (source.width > source.height ? source.width : source.height);
-  final effectiveScale = requestedScale < dimensionScale
-      ? requestedScale
-      : dimensionScale;
+  final effectiveScale = exportScaleForDimensions(
+    width: source.width,
+    height: source.height,
+    requestedScale: scaleFactor,
+  );
   if (effectiveScale >= 1) return source;
   return img.copyResize(
     source,
@@ -2711,7 +3497,7 @@ img.Image _scaleExportImage(img.Image source, double scaleFactor) {
 
 Future<String> saveToPublicDownloads({
   required String fileName,
-  required Uint8List bytes,
+  required File sourceFile,
   required String mimeType,
 }) async {
   if (Platform.isAndroid) {
@@ -2720,7 +3506,7 @@ Future<String> saveToPublicDownloads({
       final savedPath = await channel.invokeMethod<String>('saveFile', {
         'fileName': fileName,
         'mimeType': mimeType,
-        'bytes': bytes,
+        'sourcePath': sourceFile.path,
       });
       if (savedPath != null && savedPath.isNotEmpty) {
         return savedPath;
@@ -2733,7 +3519,7 @@ Future<String> saveToPublicDownloads({
   final downloadsDir = await StorageService().downloads();
   final outputFile = _nextAvailableExportFile(downloadsDir, fileName);
   await outputFile.parent.create(recursive: true);
-  await outputFile.writeAsBytes(bytes);
+  await sourceFile.copy(outputFile.path);
   return outputFile.path;
 }
 
@@ -2759,6 +3545,7 @@ Future<String> exportDocumentImagesToDownloads({
   required String fileName,
   String fileSize = 'Actual',
   bool saveToDownloads = true,
+  void Function(int)? onProgress,
 }) async {
   final extension = fileType.toLowerCase() == 'jpg' ? 'jpg' : 'pdf';
   final cleanName = sanitizeExportFileName(fileName, extension);
@@ -2778,9 +3565,9 @@ Future<String> exportDocumentImagesToDownloads({
     outputFile: tempFile,
     scaleFactor: exportScaleForSize(fileSize),
     quality: exportQualityForSize(fileSize),
+    onProgress: onProgress ?? (progress) => _generatingProgress.value = progress,
   );
 
-  final bytes = await tempFile.readAsBytes();
   if (!saveToDownloads) {
     return tempFile.path;
   }
@@ -2790,7 +3577,7 @@ Future<String> exportDocumentImagesToDownloads({
   final targetName = fileNameWithExtension;
   final publicPath = await saveToPublicDownloads(
     fileName: targetName,
-    bytes: bytes,
+    sourceFile: tempFile,
     mimeType: mimeType,
   );
 
@@ -2984,9 +3771,7 @@ class _DocumentPageState extends State<DocumentPage> {
 
   Future<void> _reorderImages(String fromPath, String toPath) async {
     final currentImages = images;
-    final fromIndex = currentImages.indexWhere(
-      (file) => file.path == fromPath,
-    );
+    final fromIndex = currentImages.indexWhere((file) => file.path == fromPath);
     final toIndex = currentImages.indexWhere((file) => file.path == toPath);
     if (_isReordering ||
         fromIndex < 0 ||
@@ -3059,12 +3844,12 @@ class _DocumentPageState extends State<DocumentPage> {
 
       await Future.wait(
         List.generate(temporaryFiles.length, (index) async {
-        await temporaryFiles[index].rename(
-          path.join(
-            widget.document.directory.path,
-            '${index + 1}${stagedImages[index].extension}',
-          ),
-        );
+          await temporaryFiles[index].rename(
+            path.join(
+              widget.document.directory.path,
+              '${index + 1}${stagedImages[index].extension}',
+            ),
+          );
         }),
       );
       reordered = true;
@@ -3178,10 +3963,12 @@ class _DocumentPageState extends State<DocumentPage> {
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
                       initialValue: fileSize,
-                      decoration: const InputDecoration(labelText: 'File Size'),
-                      items: buildExportSizeItems(
-                        documentTotalBytes([widget.document]),
+                      decoration: InputDecoration(
+                        labelText: fileType == 'pdf'
+                            ? 'PDF output size'
+                            : 'JPG output size',
                       ),
+                      items: buildExportSizeItems(),
                       onChanged: (value) =>
                           setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
@@ -3289,10 +4076,12 @@ class _DocumentPageState extends State<DocumentPage> {
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
                       initialValue: fileSize,
-                      decoration: const InputDecoration(labelText: 'File Size'),
-                      items: buildExportSizeItems(
-                        documentTotalBytes([widget.document]),
+                      decoration: InputDecoration(
+                        labelText: fileType == 'pdf'
+                            ? 'PDF output size'
+                            : 'JPG output size',
                       ),
+                      items: buildExportSizeItems(),
                       onChanged: (value) =>
                           setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
@@ -3355,13 +4144,25 @@ class _DocumentPageState extends State<DocumentPage> {
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
-      title: GestureDetector(
-        onTap: _renameDocument,
-        child: Text(
-          _currentName,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
+      title: LayoutBuilder(
+        builder: (context, constraints) {
+          final maxTitleWidth = (constraints.maxWidth - 136.0).clamp(
+            80.0,
+            constraints.maxWidth,
+          );
+          return ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: maxTitleWidth),
+            child: GestureDetector(
+              onTap: _renameDocument,
+              child: Text(
+                _currentName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                softWrap: false,
+              ),
+            ),
+          );
+        },
       ),
       actions: [
         if (images.isNotEmpty)
@@ -3494,9 +4295,9 @@ class _DocumentPageState extends State<DocumentPage> {
                               decoration: BoxDecoration(
                                 border: isDropTarget
                                     ? Border.all(
-                                        color: Theme.of(context)
-                                            .colorScheme
-                                            .primary,
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
                                         width: 3,
                                       )
                                     : null,
@@ -3547,8 +4348,9 @@ class _DocumentPageState extends State<DocumentPage> {
                                         ),
                                         decoration: BoxDecoration(
                                           color: Colors.black54,
-                                          borderRadius:
-                                              BorderRadius.circular(999),
+                                          borderRadius: BorderRadius.circular(
+                                            999,
+                                          ),
                                         ),
                                         child: Text(
                                           '${index + 1}',
@@ -3722,10 +4524,12 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
                       initialValue: fileSize,
-                      decoration: const InputDecoration(labelText: 'File Size'),
-                      items: buildExportSizeItems(
-                        documentTotalBytes([widget.document]),
+                      decoration: InputDecoration(
+                        labelText: fileType == 'pdf'
+                            ? 'PDF output size'
+                            : 'JPG output size',
                       ),
+                      items: buildExportSizeItems(),
                       onChanged: (value) =>
                           setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
@@ -3832,10 +4636,12 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                     const SizedBox(height: 12),
                     DropdownButtonFormField<String>(
                       initialValue: fileSize,
-                      decoration: const InputDecoration(labelText: 'File Size'),
-                      items: buildExportSizeItems(
-                        documentTotalBytes([widget.document]),
+                      decoration: InputDecoration(
+                        labelText: fileType == 'pdf'
+                            ? 'PDF output size'
+                            : 'JPG output size',
                       ),
+                      items: buildExportSizeItems(),
                       onChanged: (value) =>
                           setDialogState(() => fileSize = value ?? 'Actual'),
                     ),
