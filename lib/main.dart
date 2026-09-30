@@ -149,10 +149,10 @@ class DocumentFolder {
     });
   }
 
-  int get sizeBytes => directory
-      .listSync()
-      .whereType<File>()
-      .fold<int>(0, (total, file) => total + file.lengthSync());
+  int get sizeBytes => directory.listSync().whereType<File>().fold<int>(
+    0,
+    (total, file) => total + file.lengthSync(),
+  );
 
   List<File> get images =>
       directory
@@ -185,30 +185,49 @@ class DocumentFolder {
   int get hashCode => directory.path.hashCode;
 }
 
+class EditedImageResult {
+  final File sourceFile;
+  final File editedFile;
+
+  const EditedImageResult({required this.sourceFile, required this.editedFile});
+}
+
 class ImageEditorPage extends StatefulWidget {
   final File file;
-  const ImageEditorPage({required this.file, super.key});
+  final List<File> files;
+  const ImageEditorPage({required this.file, this.files = const [], super.key});
 
   @override
   State<ImageEditorPage> createState() => _ImageEditorPageState();
 }
 
 class _ImageEditorPageState extends State<ImageEditorPage> {
+  late final List<File> _files = widget.files.isEmpty
+      ? [widget.file]
+      : List<File>.unmodifiable(widget.files);
+  int _imageIndex = 0;
   late File _currentFile;
   Uint8List? _displayedBytes;
   int _brightness = 0;
   int _contrast = 0;
   bool _showOriginal = false;
   bool _isBusy = false;
+  bool _hasUnsavedChanges = false;
   File? _enhancementBaseFile;
+
+  File get _sourceFile => _files[_imageIndex];
 
   @override
   void initState() {
     super.initState();
     _currentFile = widget.file;
+    final initialIndex = _files.indexWhere(
+      (file) => file.path == widget.file.path,
+    );
+    if (initialIndex >= 0) _imageIndex = initialIndex;
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       if (!mounted) return;
-      final initialBytes = await widget.file.readAsBytes();
+      final initialBytes = await _sourceFile.readAsBytes();
       if (mounted) {
         setState(() => _displayedBytes = initialBytes);
       }
@@ -245,7 +264,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
 
   Future<void> _applyEnhancement() async {
     final source =
-        _enhancementBaseFile ?? (_showOriginal ? widget.file : _currentFile);
+        _enhancementBaseFile ?? (_showOriginal ? _sourceFile : _currentFile);
     final bytes = await source.readAsBytes();
     final decoded = img.decodeImage(bytes);
     if (decoded == null) return;
@@ -263,6 +282,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       _currentFile = updated;
       _displayedBytes = _displayedBytes ?? output;
       _enhancementBaseFile ??= source;
+      _hasUnsavedChanges = true;
     });
   }
 
@@ -290,6 +310,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       _showOriginal = false;
       _currentFile = nextFile;
       _enhancementBaseFile = null;
+      _hasUnsavedChanges = true;
     });
   }
 
@@ -317,20 +338,22 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
         _currentFile = updated;
         _displayedBytes = output;
         _enhancementBaseFile = null;
+        _hasUnsavedChanges = true;
       });
     }
   }
 
   Future<void> _resetImage() async {
-    final originalBytes = await widget.file.readAsBytes();
+    final originalBytes = await _sourceFile.readAsBytes();
     if (!mounted) return;
     setState(() {
       _brightness = 0;
       _contrast = 0;
       _showOriginal = false;
-      _currentFile = widget.file;
+      _currentFile = _sourceFile;
       _displayedBytes = originalBytes;
       _enhancementBaseFile = null;
+      _hasUnsavedChanges = false;
     });
   }
 
@@ -341,7 +364,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     );
     if (!mounted || signatureBytes == null || signatureBytes.isEmpty) return;
 
-    final source = _showOriginal ? widget.file : _currentFile;
+    final source = _showOriginal ? _sourceFile : _currentFile;
     final bytes = await source.readAsBytes();
     if (!context.mounted) return;
     final placementContext = context;
@@ -361,6 +384,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       _currentFile = updated;
       _displayedBytes = _displayedBytes ?? placedBytes;
       _enhancementBaseFile = null;
+      _hasUnsavedChanges = true;
     });
   }
 
@@ -381,7 +405,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       return;
     }
 
-    final source = _showOriginal ? widget.file : _currentFile;
+    final source = _showOriginal ? _sourceFile : _currentFile;
     final imageBytes = await source.readAsBytes();
     if (!context.mounted) return;
     final placementContext = context;
@@ -402,6 +426,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       _currentFile = updated;
       _displayedBytes = _displayedBytes ?? placedBytes;
       _enhancementBaseFile = null;
+      _hasUnsavedChanges = true;
     });
   }
 
@@ -411,7 +436,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     );
     if (!mounted || selectedImage == null) return;
 
-    final source = _showOriginal ? widget.file : _currentFile;
+    final source = _showOriginal ? _sourceFile : _currentFile;
     final imageBytes = await source.readAsBytes();
     final overlayBytes = await File(selectedImage.path).readAsBytes();
     if (!mounted) return;
@@ -432,14 +457,81 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       _currentFile = updated;
       _displayedBytes = _displayedBytes ?? placedBytes;
       _enhancementBaseFile = null;
+      _hasUnsavedChanges = true;
     });
+  }
+
+  Future<bool> _confirmImageChange() async {
+    if (!_hasUnsavedChanges) return true;
+
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Save changes?'),
+        content: const Text(
+          'This image has unsaved changes. Save them before moving to another image?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, 'cancel'),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, 'discard'),
+            child: const Text('Discard'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, 'save'),
+            child: const Text('Save and continue'),
+          ),
+        ],
+      ),
+    );
+
+    if (!mounted || choice == null || choice == 'cancel') return false;
+    if (choice == 'save') {
+      final bytes = await _currentFile.readAsBytes();
+      await _sourceFile.writeAsBytes(compressEditedImage(bytes, quality: 82));
+      await FileImage(_sourceFile).evict();
+    }
+    return true;
+  }
+
+  Future<void> _showAdjacentImage(int direction) async {
+    if (_isBusy) return;
+    final nextIndex = _imageIndex + direction;
+    if (nextIndex < 0 || nextIndex >= _files.length) return;
+    if (!await _confirmImageChange() || !mounted) return;
+
+    final nextFile = _files[nextIndex];
+    final nextBytes = await nextFile.readAsBytes();
+    if (!mounted) return;
+    setState(() {
+      _imageIndex = nextIndex;
+      _currentFile = nextFile;
+      _displayedBytes = nextBytes;
+      _brightness = 0;
+      _contrast = 0;
+      _showOriginal = false;
+      _hasUnsavedChanges = false;
+      _enhancementBaseFile = null;
+    });
+  }
+
+  void _handlePreviewSwipe(DragEndDetails details) {
+    final velocity = details.primaryVelocity ?? 0;
+    if (velocity.abs() < 150) return;
+    _showAdjacentImage(velocity < 0 ? 1 : -1);
   }
 
   Future<void> _saveImage() async {
     final updatedBytes = await _currentFile.readAsBytes();
     final savedFile = await _persistEditedImage(updatedBytes, 'saved');
     if (!mounted) return;
-    Navigator.pop(context, savedFile);
+    Navigator.pop(
+      context,
+      EditedImageResult(sourceFile: _sourceFile, editedFile: savedFile),
+    );
   }
 
   Future<void> _recognizeText() async {
@@ -455,7 +547,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     await _runAction(() async {
       final recognizer = TextRecognizer(script: TextRecognitionScript.latin);
       try {
-        final source = _showOriginal ? widget.file : _currentFile;
+        final source = _showOriginal ? _sourceFile : _currentFile;
         final recognizedText = await recognizer.processImage(
           InputImage.fromFilePath(source.path),
         );
@@ -491,7 +583,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   @override
   Widget build(BuildContext context) {
     final canEdit = _currentFile.existsSync();
-    final displayedFile = _showOriginal ? widget.file : _currentFile;
+    final displayedFile = _showOriginal ? _sourceFile : _currentFile;
     final previewBytes = !_showOriginal ? _displayedBytes : null;
 
     return Scaffold(
@@ -619,9 +711,13 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                     borderRadius: BorderRadius.circular(18),
                   ),
                   child: canEdit
-                      ? (previewBytes != null
-                            ? Image.memory(previewBytes, fit: BoxFit.contain)
-                            : Image.file(displayedFile, fit: BoxFit.contain))
+                      ? GestureDetector(
+                          key: const ValueKey('edit-image-preview'),
+                          onHorizontalDragEnd: _handlePreviewSwipe,
+                          child: previewBytes != null
+                              ? Image.memory(previewBytes, fit: BoxFit.contain)
+                              : Image.file(displayedFile, fit: BoxFit.contain),
+                        )
                       : const Center(child: Text('Image unavailable')),
                 ),
               ),
@@ -2017,9 +2113,7 @@ class StorageService {
             path.join(document.directory.path, '$pageNumber.jpg'),
           );
           await imageFile.writeAsBytes(rendered.bytes);
-          onProgress?.call(
-            (pageNumber * 100 / pdfDocument.pagesCount).round(),
-          );
+          onProgress?.call((pageNumber * 100 / pdfDocument.pagesCount).round());
         } finally {
           await page.close();
         }
@@ -2543,6 +2637,12 @@ class _HomePageState extends State<HomePage> {
 
     String fileType = 'pdf';
     String fileSize = 'Actual';
+    Future<int> calculateEstimate() => estimateExportSizeForImages(
+      images: _selectedDocuments.expand((document) => document.images).toList(),
+      fileType: fileType,
+      fileSize: fileSize,
+    );
+    var exportEstimate = calculateEstimate();
 
     final result = await showDialog<Map<String, String>>(
       context: context,
@@ -2566,7 +2666,10 @@ class _HomePageState extends State<HomePage> {
                       onChanged: (value) {
                         final nextType = value ?? fileType;
                         if (nextType == fileType) return;
-                        setDialogState(() => fileType = nextType);
+                        setDialogState(() {
+                          fileType = nextType;
+                          exportEstimate = calculateEstimate();
+                        });
                       },
                     ),
                     const SizedBox(height: 12),
@@ -2578,9 +2681,13 @@ class _HomePageState extends State<HomePage> {
                             : 'JPG output size',
                       ),
                       items: buildExportSizeItems(),
-                      onChanged: (value) =>
-                          setDialogState(() => fileSize = value ?? 'Actual'),
+                      onChanged: (value) => setDialogState(() {
+                        fileSize = value ?? 'Actual';
+                        exportEstimate = calculateEstimate();
+                      }),
                     ),
+                    const SizedBox(height: 4),
+                    ExportSizeEstimate(estimate: exportEstimate),
                   ],
                 ),
               ),
@@ -3201,6 +3308,73 @@ String formatByteSize(int bytes) {
   return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
 }
 
+int estimateExportSizeBytes({
+  required List<int> sourceFileSizes,
+  required String fileType,
+  required String fileSize,
+}) {
+  final sourceBytes = sourceFileSizes.fold<int>(
+    0,
+    (total, size) => total + size,
+  );
+  if (sourceBytes == 0) return 0;
+
+  final scaleRatio =
+      exportScaleForSize(fileSize) / exportScaleForSize('Actual');
+  final qualityRatio =
+      exportQualityForSize(fileSize) / exportQualityForSize('Actual');
+  final encodedBytes = sourceBytes * scaleRatio * scaleRatio * qualityRatio;
+  final containerBytes = fileType.toLowerCase() == 'pdf'
+      ? sourceFileSizes.length * 1024 + 512
+      : 2048;
+  return encodedBytes.round() + containerBytes;
+}
+
+Future<int> estimateExportSizeForImages({
+  required List<File> images,
+  required String fileType,
+  required String fileSize,
+}) async {
+  final sourceFileSizes = await Future.wait(
+    images.map((image) => image.length()),
+  );
+  return estimateExportSizeBytes(
+    sourceFileSizes: sourceFileSizes,
+    fileType: fileType,
+    fileSize: fileSize,
+  );
+}
+
+class ExportSizeEstimate extends StatelessWidget {
+  const ExportSizeEstimate({required this.estimate, super.key});
+
+  final Future<int> estimate;
+
+  @override
+  Widget build(BuildContext context) => FutureBuilder<int>(
+    future: estimate,
+    builder: (context, snapshot) {
+      final message = snapshot.hasError
+          ? 'Approximate file size unavailable'
+          : snapshot.hasData
+          ? 'Approximate file size: ~${formatByteSize(snapshot.data!)}'
+          : 'Estimating file size...';
+      return Align(
+        alignment: Alignment.centerLeft,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Text(
+            message,
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      );
+    },
+  );
+}
+
 List<DropdownMenuItem<String>> buildExportSizeItems() => exportSizeOptions
     .entries
     .map((entry) => DropdownMenuItem(value: entry.key, child: Text(entry.key)))
@@ -3289,13 +3463,13 @@ Future<File> _generateExportFile({
     if (message is int) onProgress?.call(message);
   });
   final arguments = <String, Object?>{
-      'imagePaths': images.map((image) => image.path).toList(),
-      'fileType': fileType,
-      'outputPath': outputFile.path,
-      'scaleFactor': scaleFactor,
-      'quality': quality,
-      'progressPort': progressPort.sendPort,
-    };
+    'imagePaths': images.map((image) => image.path).toList(),
+    'fileType': fileType,
+    'outputPath': outputFile.path,
+    'scaleFactor': scaleFactor,
+    'quality': quality,
+    'progressPort': progressPort.sendPort,
+  };
 
   try {
     if (shouldInline) {
@@ -3565,7 +3739,8 @@ Future<String> exportDocumentImagesToDownloads({
     outputFile: tempFile,
     scaleFactor: exportScaleForSize(fileSize),
     quality: exportQualityForSize(fileSize),
-    onProgress: onProgress ?? (progress) => _generatingProgress.value = progress,
+    onProgress:
+        onProgress ?? (progress) => _generatingProgress.value = progress,
   );
 
   if (!saveToDownloads) {
@@ -3744,22 +3919,28 @@ class _DocumentPageState extends State<DocumentPage> {
   Future<void> _openImageEditor(File file) async {
     final result = await Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => ImageEditorPage(file: file)),
+      MaterialPageRoute(
+        builder: (_) => ImageEditorPage(file: file, files: images),
+      ),
     );
 
-    if (result is File && mounted) {
-      final updated = result;
-      final target = File(file.path);
-      if (!await updated.exists()) return;
-
-      final updatedBytes = await updated.readAsBytes();
-      await target.writeAsBytes(updatedBytes, flush: true);
-      await FileImage(target).evict();
-      if (updated.path != target.path && await updated.exists()) {
-        await updated.delete();
-      }
+    if (!mounted) return;
+    if (result is! EditedImageResult) {
       setState(() => _imageRefreshToken++);
+      return;
     }
+
+    final updated = result.editedFile;
+    final target = File(result.sourceFile.path);
+    if (!await updated.exists()) return;
+
+    final updatedBytes = await updated.readAsBytes();
+    await target.writeAsBytes(updatedBytes, flush: true);
+    await FileImage(target).evict();
+    if (updated.path != target.path && await updated.exists()) {
+      await updated.delete();
+    }
+    setState(() => _imageRefreshToken++);
   }
 
   Future<void> _remove(File file) async {
@@ -3933,6 +4114,12 @@ class _DocumentPageState extends State<DocumentPage> {
 
     String fileType = 'pdf';
     String fileSize = 'Actual';
+    Future<int> calculateEstimate() => estimateExportSizeForImages(
+      images: images,
+      fileType: fileType,
+      fileSize: fileSize,
+    );
+    var exportEstimate = calculateEstimate();
     final fileNameController = TextEditingController(text: _currentName);
 
     final result = await showDialog<Map<String, String>>(
@@ -3957,7 +4144,10 @@ class _DocumentPageState extends State<DocumentPage> {
                       onChanged: (value) {
                         final nextType = value ?? fileType;
                         if (nextType == fileType) return;
-                        setDialogState(() => fileType = nextType);
+                        setDialogState(() {
+                          fileType = nextType;
+                          exportEstimate = calculateEstimate();
+                        });
                       },
                     ),
                     const SizedBox(height: 12),
@@ -3969,9 +4159,13 @@ class _DocumentPageState extends State<DocumentPage> {
                             : 'JPG output size',
                       ),
                       items: buildExportSizeItems(),
-                      onChanged: (value) =>
-                          setDialogState(() => fileSize = value ?? 'Actual'),
+                      onChanged: (value) => setDialogState(() {
+                        fileSize = value ?? 'Actual';
+                        exportEstimate = calculateEstimate();
+                      }),
                     ),
+                    const SizedBox(height: 4),
+                    ExportSizeEstimate(estimate: exportEstimate),
                     const SizedBox(height: 12),
                     TextFormField(
                       controller: fileNameController,
@@ -4046,6 +4240,12 @@ class _DocumentPageState extends State<DocumentPage> {
 
     String fileType = 'pdf';
     String fileSize = 'Actual';
+    Future<int> calculateEstimate() => estimateExportSizeForImages(
+      images: images,
+      fileType: fileType,
+      fileSize: fileSize,
+    );
+    var exportEstimate = calculateEstimate();
     final fileNameController = TextEditingController(text: _currentName);
 
     final result = await showDialog<Map<String, String>>(
@@ -4070,7 +4270,10 @@ class _DocumentPageState extends State<DocumentPage> {
                       onChanged: (value) {
                         final nextType = value ?? fileType;
                         if (nextType == fileType) return;
-                        setDialogState(() => fileType = nextType);
+                        setDialogState(() {
+                          fileType = nextType;
+                          exportEstimate = calculateEstimate();
+                        });
                       },
                     ),
                     const SizedBox(height: 12),
@@ -4082,9 +4285,13 @@ class _DocumentPageState extends State<DocumentPage> {
                             : 'JPG output size',
                       ),
                       items: buildExportSizeItems(),
-                      onChanged: (value) =>
-                          setDialogState(() => fileSize = value ?? 'Actual'),
+                      onChanged: (value) => setDialogState(() {
+                        fileSize = value ?? 'Actual';
+                        exportEstimate = calculateEstimate();
+                      }),
                     ),
+                    const SizedBox(height: 4),
+                    ExportSizeEstimate(estimate: exportEstimate),
                     const SizedBox(height: 12),
                     TextFormField(
                       controller: fileNameController,
@@ -4492,6 +4699,12 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
 
     String fileType = 'pdf';
     String fileSize = 'Actual';
+    Future<int> calculateEstimate() => estimateExportSizeForImages(
+      images: widget.document.images,
+      fileType: fileType,
+      fileSize: fileSize,
+    );
+    var exportEstimate = calculateEstimate();
     final fileNameController = TextEditingController(
       text: widget.document.name,
     );
@@ -4518,7 +4731,10 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                       onChanged: (value) {
                         final nextType = value ?? fileType;
                         if (nextType == fileType) return;
-                        setDialogState(() => fileType = nextType);
+                        setDialogState(() {
+                          fileType = nextType;
+                          exportEstimate = calculateEstimate();
+                        });
                       },
                     ),
                     const SizedBox(height: 12),
@@ -4530,9 +4746,13 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                             : 'JPG output size',
                       ),
                       items: buildExportSizeItems(),
-                      onChanged: (value) =>
-                          setDialogState(() => fileSize = value ?? 'Actual'),
+                      onChanged: (value) => setDialogState(() {
+                        fileSize = value ?? 'Actual';
+                        exportEstimate = calculateEstimate();
+                      }),
                     ),
+                    const SizedBox(height: 4),
+                    ExportSizeEstimate(estimate: exportEstimate),
                     const SizedBox(height: 12),
                     TextFormField(
                       controller: fileNameController,
@@ -4604,6 +4824,12 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
 
     String fileType = 'pdf';
     String fileSize = 'Actual';
+    Future<int> calculateEstimate() => estimateExportSizeForImages(
+      images: widget.document.images,
+      fileType: fileType,
+      fileSize: fileSize,
+    );
+    var exportEstimate = calculateEstimate();
     final fileNameController = TextEditingController(
       text: widget.document.name,
     );
@@ -4630,7 +4856,10 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                       onChanged: (value) {
                         final nextType = value ?? fileType;
                         if (nextType == fileType) return;
-                        setDialogState(() => fileType = nextType);
+                        setDialogState(() {
+                          fileType = nextType;
+                          exportEstimate = calculateEstimate();
+                        });
                       },
                     ),
                     const SizedBox(height: 12),
@@ -4642,9 +4871,13 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
                             : 'JPG output size',
                       ),
                       items: buildExportSizeItems(),
-                      onChanged: (value) =>
-                          setDialogState(() => fileSize = value ?? 'Actual'),
+                      onChanged: (value) => setDialogState(() {
+                        fileSize = value ?? 'Actual';
+                        exportEstimate = calculateEstimate();
+                      }),
                     ),
+                    const SizedBox(height: 4),
+                    ExportSizeEstimate(estimate: exportEstimate),
                     const SizedBox(height: 12),
                     TextFormField(
                       controller: fileNameController,
