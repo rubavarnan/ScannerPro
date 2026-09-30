@@ -1,4 +1,4 @@
-package com.example.scanner_pro
+package com.varana.scannerproplus
 
 import android.content.ContentValues
 import android.content.Intent

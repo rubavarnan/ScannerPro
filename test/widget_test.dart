@@ -1,7 +1,7 @@
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
 
@@ -14,6 +14,96 @@ void main() {
 
     expect(find.byType(MaterialApp), findsOneWidget);
     expect(find.byType(HomePage), findsOneWidget);
+  });
+
+  testWidgets('swiping between edited images asks before leaving', (
+    WidgetTester tester,
+  ) async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'scanner_pro_editor_swipe_test_',
+    );
+    addTearDown(() async => tempDir.delete(recursive: true));
+    final pathProviderChannel = const MethodChannel(
+      'plugins.flutter.io/path_provider',
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          pathProviderChannel,
+          (_) async => tempDir.path,
+        );
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(pathProviderChannel, null),
+    );
+
+    final firstImage = img.Image(width: 24, height: 12);
+    final secondImage = img.Image(width: 18, height: 10);
+    final firstFile = File('${tempDir.path}/1.jpg')
+      ..writeAsBytesSync(img.encodeJpg(firstImage));
+    final secondFile = File('${tempDir.path}/2.jpg')
+      ..writeAsBytesSync(img.encodeJpg(secondImage));
+    final secondBytes = await secondFile.readAsBytes();
+
+    Future<void> pumpEditorFrames() async {
+      for (var frame = 0; frame < 8; frame++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+    }
+
+    Future<void> settleEditorAction() async {
+      await tester.pump();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)),
+      );
+      await pumpEditorFrames();
+    }
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ImageEditorPage(file: firstFile, files: [firstFile, secondFile]),
+      ),
+    );
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 50)),
+    );
+    await pumpEditorFrames();
+
+    await tester.tap(find.byTooltip('Rotate'));
+    await settleEditorAction();
+    await tester.drag(
+      find.byKey(const ValueKey('edit-image-preview')),
+      const Offset(-300, 0),
+    );
+    await pumpEditorFrames();
+    expect(find.text('Save changes?'), findsOneWidget);
+
+    await tester.tap(find.text('Cancel'));
+    await pumpEditorFrames();
+    expect(find.text('Save changes?'), findsNothing);
+
+    await tester.drag(
+      find.byKey(const ValueKey('edit-image-preview')),
+      const Offset(-300, 0),
+    );
+    await pumpEditorFrames();
+    await tester.tap(find.text('Save and continue'));
+    await pumpEditorFrames();
+
+    final savedFirst = img.decodeImage(await firstFile.readAsBytes());
+    expect(savedFirst?.width, 12);
+    expect(savedFirst?.height, 24);
+    final previewImage = tester.widget<Image>(find.byType(Image));
+    expect((previewImage.image as MemoryImage).bytes, secondBytes);
+
+    await tester.tap(find.byTooltip('Rotate'));
+    await settleEditorAction();
+    await tester.drag(
+      find.byKey(const ValueKey('edit-image-preview')),
+      const Offset(300, 0),
+    );
+    await pumpEditorFrames();
+    expect(find.text('Save changes?'), findsOneWidget);
   });
 
   testWidgets('watermark dialog starts with watermark text and opacity', (
@@ -123,6 +213,28 @@ void main() {
       ),
       isFalse,
     );
+  });
+
+  test('export size estimate follows the selected preset and format', () {
+    final actualJpg = estimateExportSizeBytes(
+      sourceFileSizes: [1024 * 1024, 512 * 1024],
+      fileType: 'jpg',
+      fileSize: 'Actual',
+    );
+    final smallJpg = estimateExportSizeBytes(
+      sourceFileSizes: [1024 * 1024, 512 * 1024],
+      fileType: 'jpg',
+      fileSize: 'Small',
+    );
+    final actualPdf = estimateExportSizeBytes(
+      sourceFileSizes: [1024 * 1024, 512 * 1024],
+      fileType: 'pdf',
+      fileSize: 'Actual',
+    );
+
+    expect(smallJpg, lessThan(actualJpg));
+    expect(actualPdf, greaterThan(actualJpg));
+    expect(formatByteSize(actualJpg), contains('MB'));
   });
 
   test('reduced export sizes stay distinct after the resolution cap', () {
