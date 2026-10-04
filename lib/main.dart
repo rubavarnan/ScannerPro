@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:ui' as ui;
@@ -74,6 +75,45 @@ void hideGeneratingDialog(BuildContext context) {
   }
 }
 
+Future<T> runWithProgressDialog<T>(
+  BuildContext context, {
+  required String message,
+  required Future<T> Function() action,
+}) async {
+  final navigator = Navigator.of(context, rootNavigator: true);
+  final route = DialogRoute<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => PopScope(
+      canPop: false,
+      child: AlertDialog(
+        content: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 24,
+              height: 24,
+              child: CircularProgressIndicator(strokeWidth: 3),
+            ),
+            const SizedBox(width: 16),
+            Text(message),
+          ],
+        ),
+      ),
+    ),
+  );
+  final routeFuture = navigator.push<void>(route);
+  try {
+    await WidgetsBinding.instance.endOfFrame;
+    return await action();
+  } finally {
+    if (navigator.mounted && route.isActive) {
+      navigator.removeRoute(route);
+    }
+    await routeFuture;
+  }
+}
+
 Uint8List compressEditedImage(Uint8List bytes, {int quality = 82}) {
   final decoded = img.decodeImage(bytes);
   if (decoded == null) return bytes;
@@ -124,35 +164,56 @@ List<File> reorderFilesForDrag(List<File> files, int fromIndex, int toIndex) {
 
   final ordered = List<File>.from(files);
   final moved = ordered.removeAt(fromIndex);
-  final insertAt = (fromIndex < toIndex ? toIndex - 1 : toIndex).clamp(
-    0,
-    ordered.length,
-  );
+  final insertAt = toIndex.clamp(0, ordered.length);
   ordered.insert(insertAt, moved);
   return ordered;
 }
 
 class DocumentFolder {
+  static const _createdAtFileName = '.scanner_pro_created_at';
+
   Directory directory;
   DocumentFolder(this.directory);
 
   String get name => path.basename(directory.path);
   File get pdfFile => File(path.join(directory.path, '$name.pdf'));
+  File get _createdAtFile =>
+      File(path.join(directory.path, _createdAtFileName));
 
-  DateTime get createdDate => directory.statSync().changed;
+  DateTime get createdDate {
+    if (_createdAtFile.existsSync()) {
+      final savedDate = DateTime.tryParse(_createdAtFile.readAsStringSync());
+      if (savedDate != null) return savedDate;
+    }
+    return directory.statSync().changed;
+  }
+
+  Future<void> preserveCreatedDate() async {
+    if (_createdAtFile.existsSync()) {
+      final savedDate = DateTime.tryParse(await _createdAtFile.readAsString());
+      if (savedDate != null) return;
+    }
+    await _createdAtFile.writeAsString(
+      directory.statSync().changed.toIso8601String(),
+      flush: true,
+    );
+  }
 
   DateTime get modifiedDate {
-    final files = directory.listSync().whereType<File>();
+    final files = directory.listSync().whereType<File>().where(
+      (file) => path.basename(file.path) != _createdAtFileName,
+    );
     return files.fold<DateTime>(directory.statSync().modified, (latest, file) {
       final modified = file.statSync().modified;
       return modified.isAfter(latest) ? modified : latest;
     });
   }
 
-  int get sizeBytes => directory.listSync().whereType<File>().fold<int>(
-    0,
-    (total, file) => total + file.lengthSync(),
-  );
+  int get sizeBytes => directory
+      .listSync()
+      .whereType<File>()
+      .where((file) => path.basename(file.path) != _createdAtFileName)
+      .fold<int>(0, (total, file) => total + file.lengthSync());
 
   List<File> get images =>
       directory
@@ -185,6 +246,67 @@ class DocumentFolder {
   int get hashCode => directory.path.hashCode;
 }
 
+List<(int, int)> collageLayoutsForImageCount(int imageCount) {
+  if (imageCount <= 0) return const [];
+  return [
+    for (var rows = 1; rows <= 4; rows++)
+      for (var columns = 1; columns <= 3; columns++)
+        if (rows * columns >= imageCount) (rows, columns),
+  ];
+}
+
+class _CollageLayoutPreview extends StatelessWidget {
+  final int rows;
+  final int columns;
+  final int selectedCount;
+
+  const _CollageLayoutPreview({
+    required this.rows,
+    required this.columns,
+    required this.selectedCount,
+    super.key,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return AspectRatio(
+      aspectRatio: 3 / 4,
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colorScheme.surfaceContainerLow,
+          border: Border.all(color: colorScheme.outlineVariant),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: GridView.builder(
+          padding: const EdgeInsets.all(10),
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: rows * columns,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: columns,
+            crossAxisSpacing: 6,
+            mainAxisSpacing: 6,
+            childAspectRatio: 0.75 * rows / columns,
+          ),
+          itemBuilder: (context, index) => DecoratedBox(
+            decoration: BoxDecoration(
+              color: index < selectedCount
+                  ? colorScheme.primaryContainer
+                  : colorScheme.surface,
+              border: Border.all(
+                color: index < selectedCount
+                    ? colorScheme.primary
+                    : colorScheme.outlineVariant,
+              ),
+              borderRadius: BorderRadius.circular(4),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class EditedImageResult {
   final File sourceFile;
   final File editedFile;
@@ -212,6 +334,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   int _contrast = 0;
   bool _showOriginal = false;
   bool _isBusy = false;
+  bool _showBusySpinner = false;
   bool _hasUnsavedChanges = false;
   File? _enhancementBaseFile;
 
@@ -234,14 +357,23 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     });
   }
 
-  Future<void> _runAction(Future<void> Function() action) async {
+  Future<void> _runAction(
+    Future<void> Function() action, {
+    bool showSpinner = true,
+  }) async {
     if (_isBusy || !mounted) return;
-    setState(() => _isBusy = true);
+    setState(() {
+      _isBusy = true;
+      _showBusySpinner = showSpinner;
+    });
     try {
       await action();
     } finally {
       if (mounted) {
-        setState(() => _isBusy = false);
+        setState(() {
+          _isBusy = false;
+          _showBusySpinner = false;
+        });
       }
     }
   }
@@ -306,9 +438,12 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     if (cropped == null || !mounted) return;
 
     final nextFile = File(cropped.path);
+    final nextBytes = await nextFile.readAsBytes();
+    if (!mounted) return;
     setState(() {
       _showOriginal = false;
       _currentFile = nextFile;
+      _displayedBytes = nextBytes;
       _enhancementBaseFile = null;
       _hasUnsavedChanges = true;
     });
@@ -525,13 +660,41 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
   }
 
   Future<void> _saveImage() async {
-    final updatedBytes = await _currentFile.readAsBytes();
-    final savedFile = await _persistEditedImage(updatedBytes, 'saved');
-    if (!mounted) return;
-    Navigator.pop(
-      context,
-      EditedImageResult(sourceFile: _sourceFile, editedFile: savedFile),
-    );
+    if (_isBusy) return;
+    if (!_hasUnsavedChanges) {
+      Navigator.pop(
+        context,
+        EditedImageResult(sourceFile: _sourceFile, editedFile: _sourceFile),
+      );
+      return;
+    }
+
+    setState(() {
+      _isBusy = true;
+      _showBusySpinner = true;
+    });
+    try {
+      final savedFile = await runWithProgressDialog(
+        context,
+        message: 'Saving image...',
+        action: () async {
+          final updatedBytes = await _currentFile.readAsBytes();
+          return _persistEditedImage(updatedBytes, 'saved');
+        },
+      );
+      if (!mounted) return;
+      Navigator.pop(
+        context,
+        EditedImageResult(sourceFile: _sourceFile, editedFile: savedFile),
+      );
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBusy = false;
+          _showBusySpinner = false;
+        });
+      }
+    }
   }
 
   Future<void> _recognizeText() async {
@@ -565,7 +728,7 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
       } finally {
         await recognizer.close();
       }
-    });
+    }, showSpinner: false);
   }
 
   Widget _buildEditAction({
@@ -576,7 +739,13 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
     return IconButton.filled(
       tooltip: tooltip,
       onPressed: _isBusy ? null : onPressed,
-      icon: Icon(icon),
+      icon: _isBusy && _showBusySpinner
+          ? const SizedBox(
+              width: 18,
+              height: 18,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            )
+          : Icon(icon),
     );
   }
 
@@ -597,8 +766,14 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
           ),
           IconButton(
             tooltip: 'Save changes',
-            onPressed: canEdit ? _saveImage : null,
-            icon: const Icon(Icons.check),
+            onPressed: canEdit && !_isBusy ? _saveImage : null,
+            icon: _isBusy && _showBusySpinner
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.check),
           ),
         ],
       ),
@@ -634,22 +809,25 @@ class _ImageEditorPageState extends State<ImageEditorPage> {
                     _buildEditAction(
                       icon: Icons.draw,
                       tooltip: 'Signature',
-                      onPressed: () => _runAction(_addSignature),
+                      onPressed: () =>
+                          _runAction(_addSignature, showSpinner: false),
                     ),
                     _buildEditAction(
                       icon: Icons.text_fields,
                       tooltip: 'Text',
-                      onPressed: () => _runAction(_addText),
+                      onPressed: () => _runAction(_addText, showSpinner: false),
                     ),
                     _buildEditAction(
                       icon: Icons.branding_watermark,
                       tooltip: 'Watermark',
-                      onPressed: () => _runAction(_addWatermark),
+                      onPressed: () =>
+                          _runAction(_addWatermark, showSpinner: false),
                     ),
                     _buildEditAction(
                       icon: Icons.add_photo_alternate_outlined,
                       tooltip: 'Add image',
-                      onPressed: () => _runAction(_addImage),
+                      onPressed: () =>
+                          _runAction(_addImage, showSpinner: false),
                     ),
                   ];
 
@@ -1993,7 +2171,7 @@ class StorageService {
 
   Future<List<DocumentFolder>> documents() async {
     final rootDirectory = await root();
-    return rootDirectory
+    final documents = rootDirectory
         .listSync()
         .whereType<Directory>()
         .map(DocumentFolder.new)
@@ -2001,8 +2179,14 @@ class StorageService {
           (document) =>
               document.images.isNotEmpty || document.pdfFile.existsSync(),
         )
-        .toList()
-      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+        .toList();
+    for (final document in documents) {
+      await document.preserveCreatedDate();
+    }
+    documents.sort(
+      (a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()),
+    );
+    return documents;
   }
 
   Stream<List<DocumentFolder>> documentBatches({int batchSize = 12}) async* {
@@ -2014,6 +2198,7 @@ class StorageService {
 
       final document = DocumentFolder(entity);
       if (document.images.isEmpty && !document.pdfFile.existsSync()) continue;
+      await document.preserveCreatedDate();
 
       batch.add(document);
       if (batch.length < batchSize) continue;
@@ -2048,7 +2233,9 @@ class StorageService {
     }
     final directory = Directory(path.join(rootDirectory.path, name));
     await directory.create();
-    return DocumentFolder(directory);
+    final document = DocumentFolder(directory);
+    await document.preserveCreatedDate();
+    return document;
   }
 
   Future<DocumentFolder> importFile(
@@ -2144,7 +2331,9 @@ class StorageService {
     }
     final directory = Directory(path.join(rootDirectory.path, name));
     await directory.create();
-    return DocumentFolder(directory);
+    final document = DocumentFolder(directory);
+    await document.preserveCreatedDate();
+    return document;
   }
 
   Future<void> mergeDocuments(List<DocumentFolder> selectedDocuments) async {
@@ -2262,10 +2451,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _saveHomeSettings() async {
-    final preferences = await SharedPreferences.getInstance();
-    await preferences.setString('home_sort_field', _sortField);
-    await preferences.setBool('home_sort_ascending', _sortAscending);
-    await preferences.setBool('home_grid_view', _gridView);
+    await runWithProgressDialog(
+      context,
+      message: 'Saving settings...',
+      action: () async {
+        final preferences = await SharedPreferences.getInstance();
+        await preferences.setString('home_sort_field', _sortField);
+        await preferences.setBool('home_sort_ascending', _sortAscending);
+        await preferences.setBool('home_grid_view', _gridView);
+      },
+    );
   }
 
   Future<void> _showSortDialog() async {
@@ -2455,25 +2650,37 @@ class _HomePageState extends State<HomePage> {
     try {
       if (source == ImageSource.gallery) {
         final selectedImages = await ImagePicker().pickMultiImage();
+        if (!mounted) return;
         if (selectedImages.isEmpty) {
           await document.directory.delete(recursive: true);
           return;
         }
 
-        var nextIndex = 1;
-        for (final selectedImage in selectedImages) {
-          final extension = path.extension(selectedImage.name).toLowerCase();
-          final safeExtension =
-              ['.jpg', '.jpeg', '.png', '.heic'].contains(extension)
-              ? extension
-              : '.jpg';
-          final target = File(
-            path.join(document.directory.path, '${nextIndex++}$safeExtension'),
-          );
-          final bytes = await selectedImage.readAsBytes();
-          if (bytes.isEmpty) continue;
-          await target.writeAsBytes(bytes);
-        }
+        await runWithProgressDialog(
+          context,
+          message: 'Saving images...',
+          action: () async {
+            var nextIndex = 1;
+            for (final selectedImage in selectedImages) {
+              final extension = path
+                  .extension(selectedImage.name)
+                  .toLowerCase();
+              final safeExtension =
+                  ['.jpg', '.jpeg', '.png', '.heic'].contains(extension)
+                  ? extension
+                  : '.jpg';
+              final target = File(
+                path.join(
+                  document.directory.path,
+                  '${nextIndex++}$safeExtension',
+                ),
+              );
+              final bytes = await selectedImage.readAsBytes();
+              if (bytes.isEmpty) continue;
+              await target.writeAsBytes(bytes);
+            }
+          },
+        );
 
         if (document.images.isEmpty) {
           await document.directory.delete(recursive: true);
@@ -2486,21 +2693,28 @@ class _HomePageState extends State<HomePage> {
           noOfPages: 50,
           androidScannerMode: AndroidScannerMode.full,
         );
+        if (!mounted) return;
         if (scannedPaths == null || scannedPaths.isEmpty) {
           await document.directory.delete(recursive: true);
           return;
         }
 
-        var nextIndex = 1;
-        for (final scannedPath in scannedPaths) {
-          final scannedFile = File(scannedPath);
-          if (!await scannedFile.exists()) continue;
+        await runWithProgressDialog(
+          context,
+          message: 'Saving scanned pages...',
+          action: () async {
+            var nextIndex = 1;
+            for (final scannedPath in scannedPaths) {
+              final scannedFile = File(scannedPath);
+              if (!await scannedFile.exists()) continue;
 
-          final target = File(
-            path.join(document.directory.path, '${nextIndex++}.jpg'),
-          );
-          await scannedFile.copy(target.path);
-        }
+              final target = File(
+                path.join(document.directory.path, '${nextIndex++}.jpg'),
+              );
+              await scannedFile.copy(target.path);
+            }
+          },
+        );
 
         await CunningDocumentScanner.cleanCache();
         if (document.images.isEmpty) {
@@ -2563,8 +2777,15 @@ class _HomePageState extends State<HomePage> {
       _message('A file with that name already exists.');
       return;
     }
-    await document.directory.rename(destination.path);
-    _refresh();
+    if (!mounted) return;
+    await runWithProgressDialog(
+      context,
+      message: 'Renaming document...',
+      action: () async {
+        await document.directory.rename(destination.path);
+        await _refresh();
+      },
+    );
   }
 
   Future<void> _delete(DocumentFolder document) async {
@@ -2588,12 +2809,18 @@ class _HomePageState extends State<HomePage> {
       ),
     );
 
-    if (confirmed != true) return;
+    if (confirmed != true || !mounted) return;
 
-    if (await document.directory.exists()) {
-      await document.directory.delete(recursive: true);
-    }
-    _refresh();
+    await runWithProgressDialog(
+      context,
+      message: 'Deleting document...',
+      action: () async {
+        if (await document.directory.exists()) {
+          await document.directory.delete(recursive: true);
+        }
+        await _refresh();
+      },
+    );
   }
 
   Future<void> _deleteSelectedDocuments() async {
@@ -2620,16 +2847,21 @@ class _HomePageState extends State<HomePage> {
       ),
     );
 
-    if (confirmed != true) return;
+    if (confirmed != true || !mounted) return;
 
-    for (final document in _selectedDocuments.toList()) {
-      if (await document.directory.exists()) {
-        await document.directory.delete(recursive: true);
-      }
-    }
-
-    _clearSelection();
-    _refresh();
+    await runWithProgressDialog(
+      context,
+      message: 'Deleting documents...',
+      action: () async {
+        for (final document in _selectedDocuments.toList()) {
+          if (await document.directory.exists()) {
+            await document.directory.delete(recursive: true);
+          }
+        }
+        _clearSelection();
+        await _refresh();
+      },
+    );
   }
 
   Future<void> _shareSelectedDocuments() async {
@@ -2780,9 +3012,15 @@ class _HomePageState extends State<HomePage> {
 
     setState(() => _bulkProcessing = true);
     try {
-      await storage.mergeDocuments(_selectedDocuments);
-      _clearSelection();
-      await _refresh();
+      await runWithProgressDialog(
+        context,
+        message: 'Merging documents...',
+        action: () async {
+          await storage.mergeDocuments(_selectedDocuments);
+          _clearSelection();
+          await _refresh();
+        },
+      );
       _message('Documents merged into "${winner.name}".');
     } catch (error) {
       _message('Merge failed: $error');
@@ -3776,9 +4014,25 @@ class _DocumentPageState extends State<DocumentPage> {
   bool saving = false;
   bool _isReordering = false;
   int _imageRefreshToken = 0;
+  final Set<String> _selectedImages = <String>{};
   late String _currentName;
 
   List<File> get images => widget.document.images;
+
+  bool get _isImageSelectionMode => _selectedImages.isNotEmpty;
+
+  List<File> get _selectedImageFiles =>
+      images.where((file) => _selectedImages.contains(file.path)).toList();
+
+  void _toggleImageSelection(File file) {
+    setState(() {
+      if (!_selectedImages.add(file.path)) _selectedImages.remove(file.path);
+    });
+  }
+
+  void _clearImageSelection() {
+    setState(_selectedImages.clear);
+  }
 
   @override
   void initState() {
@@ -3832,6 +4086,7 @@ class _DocumentPageState extends State<DocumentPage> {
     try {
       if (source == ImageSource.gallery) {
         final selectedImages = await _pickGalleryImages();
+        if (!mounted) return;
         if (selectedImages.isEmpty) return;
 
         final nextIndexStart = images
@@ -3843,25 +4098,34 @@ class _DocumentPageState extends State<DocumentPage> {
               0,
               (highest, value) => value > highest ? value : highest,
             );
-        var nextIndex = nextIndexStart + 1;
-        var importedCount = 0;
-        for (final selectedImage in selectedImages) {
-          final extension = path.extension(selectedImage.name).toLowerCase();
-          final safeExtension =
-              ['.jpg', '.jpeg', '.png', '.heic'].contains(extension)
-              ? extension
-              : '.jpg';
-          final target = File(
-            path.join(
-              widget.document.directory.path,
-              '${nextIndex++}$safeExtension',
-            ),
-          );
-          final bytes = await selectedImage.readAsBytes();
-          if (bytes.isEmpty) continue;
-          await target.writeAsBytes(bytes);
-          importedCount++;
-        }
+        final importedCount = await runWithProgressDialog<int>(
+          context,
+          message: 'Saving images...',
+          action: () async {
+            var nextIndex = nextIndexStart + 1;
+            var count = 0;
+            for (final selectedImage in selectedImages) {
+              final extension = path
+                  .extension(selectedImage.name)
+                  .toLowerCase();
+              final safeExtension =
+                  ['.jpg', '.jpeg', '.png', '.heic'].contains(extension)
+                  ? extension
+                  : '.jpg';
+              final target = File(
+                path.join(
+                  widget.document.directory.path,
+                  '${nextIndex++}$safeExtension',
+                ),
+              );
+              final bytes = await selectedImage.readAsBytes();
+              if (bytes.isEmpty) continue;
+              await target.writeAsBytes(bytes);
+              count++;
+            }
+            return count;
+          },
+        );
 
         if (importedCount == 0) {
           throw const FileSystemException('No usable images were selected');
@@ -3878,22 +4142,29 @@ class _DocumentPageState extends State<DocumentPage> {
         androidScannerMode: AndroidScannerMode.full,
       );
 
+      if (!mounted) return;
       if (scannedPaths == null || scannedPaths.isEmpty) return;
 
       final nextIndexStart = images
           .map((file) => int.tryParse(path.basenameWithoutExtension(file.path)))
           .whereType<int>()
           .fold<int>(0, (highest, value) => value > highest ? value : highest);
-      var nextIndex = nextIndexStart + 1;
-      for (final scannedPath in scannedPaths) {
-        final scannedFile = File(scannedPath);
-        if (!await scannedFile.exists()) continue;
+      await runWithProgressDialog(
+        context,
+        message: 'Saving scanned pages...',
+        action: () async {
+          var nextIndex = nextIndexStart + 1;
+          for (final scannedPath in scannedPaths) {
+            final scannedFile = File(scannedPath);
+            if (!await scannedFile.exists()) continue;
 
-        final target = File(
-          path.join(widget.document.directory.path, '${nextIndex++}.jpg'),
-        );
-        await scannedFile.copy(target.path);
-      }
+            final target = File(
+              path.join(widget.document.directory.path, '${nextIndex++}.jpg'),
+            );
+            await scannedFile.copy(target.path);
+          }
+        },
+      );
 
       await CunningDocumentScanner.cleanCache();
       if (mounted) setState(() {});
@@ -3932,22 +4203,345 @@ class _DocumentPageState extends State<DocumentPage> {
 
     final updated = result.editedFile;
     final target = File(result.sourceFile.path);
+    if (updated.path == target.path) return;
     if (!await updated.exists()) return;
+    if (!mounted) return;
 
-    final updatedBytes = await updated.readAsBytes();
-    await target.writeAsBytes(updatedBytes, flush: true);
-    await FileImage(target).evict();
-    if (updated.path != target.path && await updated.exists()) {
-      await updated.delete();
-    }
+    await runWithProgressDialog(
+      context,
+      message: 'Saving image...',
+      action: () async {
+        final updatedBytes = await updated.readAsBytes();
+        await target.writeAsBytes(updatedBytes, flush: true);
+        await FileImage(target).evict();
+        if (updated.path != target.path && await updated.exists()) {
+          await updated.delete();
+        }
+      },
+    );
+    if (!mounted) return;
     setState(() => _imageRefreshToken++);
   }
 
   Future<void> _remove(File file) async {
     if (!await file.exists()) return;
+    if (!mounted) return;
 
-    await file.delete();
-    if (mounted) setState(() {});
+    await runWithProgressDialog(
+      context,
+      message: 'Deleting image...',
+      action: file.delete,
+    );
+    if (!mounted) return;
+    if (mounted) {
+      setState(() {
+        _selectedImages.remove(file.path);
+        _imageRefreshToken++;
+      });
+    }
+  }
+
+  Future<void> _deleteSelectedImages() async {
+    final selected = _selectedImageFiles;
+    if (selected.isEmpty) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete selected images?'),
+        content: Text('Delete ${selected.length} selected images?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    await runWithProgressDialog(
+      context,
+      message: 'Deleting images...',
+      action: () async {
+        for (final file in selected) {
+          if (await file.exists()) await file.delete();
+        }
+      },
+    );
+    if (!mounted) return;
+    setState(() {
+      _selectedImages.clear();
+      _imageRefreshToken++;
+    });
+  }
+
+  Future<void> _transferSelectedImages({required bool move}) async {
+    final selected = _selectedImageFiles;
+    if (selected.isEmpty) return;
+
+    final targets = (await StorageService().documents())
+        .where(
+          (document) =>
+              document.directory.path != widget.document.directory.path,
+        )
+        .toList();
+    if (!mounted) return;
+    if (targets.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Create another document first.')),
+      );
+      return;
+    }
+
+    final target = await showDialog<DocumentFolder>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(move ? 'Move images to' : 'Copy images to'),
+        content: SizedBox(
+          width: 360,
+          height: 320,
+          child: ListView(
+            shrinkWrap: true,
+            children: targets
+                .map(
+                  (document) => ListTile(
+                    title: Text(document.name),
+                    onTap: () => Navigator.pop(dialogContext, document),
+                  ),
+                )
+                .toList(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (target == null || !mounted) return;
+
+    setState(() => processing = true);
+    try {
+      await runWithProgressDialog(
+        context,
+        message: move ? 'Moving images...' : 'Copying images...',
+        action: () async {
+          var nextIndex =
+              target.images
+                  .map(
+                    (file) =>
+                        int.tryParse(path.basenameWithoutExtension(file.path)),
+                  )
+                  .whereType<int>()
+                  .fold<int>(
+                    0,
+                    (highest, value) => value > highest ? value : highest,
+                  ) +
+              1;
+          for (final source in selected) {
+            final extension = path.extension(source.path).toLowerCase();
+            final destination = File(
+              path.join(target.directory.path, '${nextIndex++}$extension'),
+            );
+            if (move) {
+              await source.rename(destination.path);
+            } else {
+              await source.copy(destination.path);
+            }
+          }
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _selectedImages.clear();
+        _imageRefreshToken++;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${selected.length} image${selected.length == 1 ? '' : 's'} '
+            '${move ? 'moved' : 'copied'} to ${target.name}.',
+          ),
+        ),
+      );
+      unawaited(
+        Navigator.of(context).pushReplacement<void, void>(
+          MaterialPageRoute<void>(
+            builder: (_) => DocumentPage(document: target),
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not ${move ? 'move' : 'copy'} images: $error'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => processing = false);
+    }
+  }
+
+  Future<void> _createCollage() async {
+    final selected = _selectedImageFiles;
+    final layouts = collageLayoutsForImageCount(selected.length);
+    if (layouts.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Collage supports up to 12 images.')),
+      );
+      return;
+    }
+    var layout = layouts.first;
+    final choice = await showDialog<(int, int)>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Create collage page'),
+          content: SizedBox(
+            width: 320,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<(int, int)>(
+                  initialValue: layout,
+                  decoration: const InputDecoration(labelText: 'Grid layout'),
+                  items: layouts
+                      .map(
+                        (option) => DropdownMenuItem(
+                          value: option,
+                          child: Text('${option.$1} x ${option.$2}'),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value != null) setDialogState(() => layout = value);
+                  },
+                ),
+                const SizedBox(height: 16),
+                AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 180),
+                  child: _CollageLayoutPreview(
+                    key: ValueKey(layout),
+                    rows: layout.$1,
+                    columns: layout.$2,
+                    selectedCount: selected.length,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, layout),
+              child: const Text('Create'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+
+    setState(() => processing = true);
+    try {
+      await runWithProgressDialog(
+        context,
+        message: 'Creating collage...',
+        action: () async {
+          const pageWidth = 1800;
+          const pageHeight = 2400;
+          const margin = 36;
+          const gutter = 24;
+          final rows = choice.$1;
+          final columns = choice.$2;
+          final cellWidth =
+              (pageWidth - margin * 2 - gutter * (columns - 1)) ~/ columns;
+          final cellHeight =
+              (pageHeight - margin * 2 - gutter * (rows - 1)) ~/ rows;
+          final collage = img.Image(
+            width: pageWidth,
+            height: pageHeight,
+            numChannels: 3,
+          );
+          img.fill(collage, color: img.ColorRgb8(255, 255, 255));
+
+          for (var index = 0; index < selected.length; index++) {
+            final decoded = img.decodeImage(
+              await selected[index].readAsBytes(),
+            );
+            if (decoded == null) {
+              throw FormatException(
+                'Could not read ${path.basename(selected[index].path)}',
+              );
+            }
+            final scale = (cellWidth / decoded.width).clamp(
+              0.0,
+              cellHeight / decoded.height,
+            );
+            final resized = img.copyResize(
+              decoded,
+              width: (decoded.width * scale).round().clamp(1, cellWidth),
+              height: (decoded.height * scale).round().clamp(1, cellHeight),
+            );
+            final row = index ~/ columns;
+            final column = index % columns;
+            final x =
+                margin +
+                column * (cellWidth + gutter) +
+                (cellWidth - resized.width) ~/ 2;
+            final y =
+                margin +
+                row * (cellHeight + gutter) +
+                (cellHeight - resized.height) ~/ 2;
+            img.compositeImage(collage, resized, dstX: x, dstY: y);
+          }
+
+          final nextIndex =
+              images
+                  .map(
+                    (file) =>
+                        int.tryParse(path.basenameWithoutExtension(file.path)),
+                  )
+                  .whereType<int>()
+                  .fold<int>(
+                    0,
+                    (highest, value) => value > highest ? value : highest,
+                  ) +
+              1;
+          final output = File(
+            path.join(widget.document.directory.path, '$nextIndex.jpg'),
+          );
+          await output.writeAsBytes(img.encodeJpg(collage, quality: 92));
+          if (!mounted) return;
+          setState(() {
+            _selectedImages.clear();
+            _imageRefreshToken++;
+          });
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('Collage page added.')));
+        },
+      );
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not create collage: $error')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => processing = false);
+    }
   }
 
   Future<void> _reorderImages(String fromPath, String toPath) async {
@@ -3974,66 +4568,72 @@ class _DocumentPageState extends State<DocumentPage> {
     final stagedImages = <({String extension, List<int> bytes})>[];
     var reordered = false;
     try {
-      for (final image in currentImages) {
-        await FileImage(image).evict();
-      }
+      await runWithProgressDialog(
+        context,
+        message: 'Reordering images...',
+        action: () async {
+          for (final image in currentImages) {
+            await FileImage(image).evict();
+          }
 
-      final stamp = DateTime.now().microsecondsSinceEpoch;
-      stagedImages.addAll(
-        await Future.wait(
-          orderedImages.map((source) async {
-            final bytes = await source.readAsBytes();
-            if (bytes.isEmpty) {
-              throw const FormatException(
-                'An image could not be read during reorder',
-              );
-            }
-            return (
-              extension: path.extension(source.path).toLowerCase(),
-              bytes: bytes,
-            );
-          }),
-        ),
-      );
-
-      temporaryFiles.addAll(
-        List.generate(
-          stagedImages.length,
-          (index) => File(
-            path.join(
-              widget.document.directory.path,
-              '.reorder_${stamp}_$index${stagedImages[index].extension}',
-            ),
-          ),
-        ),
-      );
-      await Future.wait(
-        List.generate(
-          stagedImages.length,
-          (index) => temporaryFiles[index].writeAsBytes(
-            stagedImages[index].bytes,
-            flush: true,
-          ),
-        ),
-      );
-
-      await Future.wait(
-        currentImages.map((source) async {
-          if (await source.exists()) await source.delete();
-        }),
-      );
-
-      await Future.wait(
-        List.generate(temporaryFiles.length, (index) async {
-          await temporaryFiles[index].rename(
-            path.join(
-              widget.document.directory.path,
-              '${index + 1}${stagedImages[index].extension}',
+          final stamp = DateTime.now().microsecondsSinceEpoch;
+          stagedImages.addAll(
+            await Future.wait(
+              orderedImages.map((source) async {
+                final bytes = await source.readAsBytes();
+                if (bytes.isEmpty) {
+                  throw const FormatException(
+                    'An image could not be read during reorder',
+                  );
+                }
+                return (
+                  extension: path.extension(source.path).toLowerCase(),
+                  bytes: bytes,
+                );
+              }),
             ),
           );
-        }),
+
+          temporaryFiles.addAll(
+            List.generate(
+              stagedImages.length,
+              (index) => File(
+                path.join(
+                  widget.document.directory.path,
+                  '.reorder_${stamp}_$index${stagedImages[index].extension}',
+                ),
+              ),
+            ),
+          );
+          await Future.wait(
+            List.generate(
+              stagedImages.length,
+              (index) => temporaryFiles[index].writeAsBytes(
+                stagedImages[index].bytes,
+                flush: true,
+              ),
+            ),
+          );
+
+          await Future.wait(
+            currentImages.map((source) async {
+              if (await source.exists()) await source.delete();
+            }),
+          );
+
+          await Future.wait(
+            List.generate(temporaryFiles.length, (index) async {
+              await temporaryFiles[index].rename(
+                path.join(
+                  widget.document.directory.path,
+                  '${index + 1}${stagedImages[index].extension}',
+                ),
+              );
+            }),
+          );
+          reordered = true;
+        },
       );
-      reordered = true;
     } catch (error) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -4044,7 +4644,23 @@ class _DocumentPageState extends State<DocumentPage> {
       if (mounted) {
         setState(() {
           _isReordering = false;
-          if (reordered) _imageRefreshToken++;
+          if (reordered) {
+            final selectedPaths = <String>{};
+            for (var index = 0; index < orderedImages.length; index++) {
+              if (_selectedImages.contains(orderedImages[index].path)) {
+                selectedPaths.add(
+                  path.join(
+                    widget.document.directory.path,
+                    '${index + 1}${stagedImages[index].extension}',
+                  ),
+                );
+              }
+            }
+            _selectedImages
+              ..clear()
+              ..addAll(selectedPaths);
+            _imageRefreshToken++;
+          }
         });
       }
     }
@@ -4085,8 +4701,15 @@ class _DocumentPageState extends State<DocumentPage> {
       }
       return;
     }
-    await widget.document.directory.rename(destination.path);
-    widget.document.directory = destination;
+    if (!mounted) return;
+    await runWithProgressDialog(
+      context,
+      message: 'Renaming document...',
+      action: () async {
+        await widget.document.directory.rename(destination.path);
+        widget.document.directory = destination;
+      },
+    );
     if (!mounted) return;
     setState(() => _currentName = clean);
     ScaffoldMessenger.of(
@@ -4098,10 +4721,11 @@ class _DocumentPageState extends State<DocumentPage> {
     required String fileType,
     required String fileName,
     required String fileSize,
+    List<File>? sourceImages,
     bool saveToDownloads = true,
   }) async {
     return exportDocumentImagesToDownloads(
-      images: images,
+      images: sourceImages ?? images,
       fileType: fileType,
       fileName: fileName,
       fileSize: fileSize,
@@ -4109,13 +4733,14 @@ class _DocumentPageState extends State<DocumentPage> {
     );
   }
 
-  Future<void> _shareDocument() async {
-    if (images.isEmpty) return;
+  Future<void> _shareDocument({List<File>? selectedImages}) async {
+    final imagesToShare = selectedImages ?? images;
+    if (imagesToShare.isEmpty) return;
 
     String fileType = 'pdf';
     String fileSize = 'Actual';
     Future<int> calculateEstimate() => estimateExportSizeForImages(
-      images: images,
+      images: imagesToShare,
       fileType: fileType,
       fileSize: fileSize,
     );
@@ -4204,6 +4829,7 @@ class _DocumentPageState extends State<DocumentPage> {
         fileType: result['fileType'] ?? 'pdf',
         fileSize: result['fileSize'] ?? 'Actual',
         fileName: result['fileName'] ?? _currentName,
+        sourceImages: imagesToShare,
         saveToDownloads: false,
       );
 
@@ -4218,6 +4844,7 @@ class _DocumentPageState extends State<DocumentPage> {
       );
 
       if (shareResult.status == ShareResultStatus.success && mounted) {
+        if (selectedImages != null) _clearImageSelection();
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Document shared successfully.')),
         );
@@ -4351,6 +4978,13 @@ class _DocumentPageState extends State<DocumentPage> {
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(
+      leading: _isImageSelectionMode
+          ? IconButton(
+              tooltip: 'Clear selection',
+              onPressed: _clearImageSelection,
+              icon: const Icon(Icons.close),
+            )
+          : null,
       title: LayoutBuilder(
         builder: (context, constraints) {
           final maxTitleWidth = (constraints.maxWidth - 136.0).clamp(
@@ -4360,9 +4994,11 @@ class _DocumentPageState extends State<DocumentPage> {
           return ConstrainedBox(
             constraints: BoxConstraints(maxWidth: maxTitleWidth),
             child: GestureDetector(
-              onTap: _renameDocument,
+              onTap: _isImageSelectionMode ? null : _renameDocument,
               child: Text(
-                _currentName,
+                _isImageSelectionMode
+                    ? '${_selectedImages.length} selected'
+                    : _currentName,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 softWrap: false,
@@ -4372,7 +5008,35 @@ class _DocumentPageState extends State<DocumentPage> {
         },
       ),
       actions: [
-        if (images.isNotEmpty)
+        if (_isImageSelectionMode)
+          PopupMenuButton<String>(
+            tooltip: 'Selected image actions',
+            enabled: !processing,
+            onSelected: (action) {
+              switch (action) {
+                case 'delete':
+                  _deleteSelectedImages();
+                case 'move':
+                  _transferSelectedImages(move: true);
+                case 'copy':
+                  _transferSelectedImages(move: false);
+                case 'collage':
+                  _createCollage();
+                case 'share':
+                  _shareDocument(
+                    selectedImages: List<File>.from(_selectedImageFiles),
+                  );
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'delete', child: Text('Delete')),
+              PopupMenuItem(value: 'move', child: Text('Move')),
+              PopupMenuItem(value: 'copy', child: Text('Copy')),
+              PopupMenuItem(value: 'collage', child: Text('Collage')),
+              PopupMenuItem(value: 'share', child: Text('Share')),
+            ],
+          ),
+        if (!_isImageSelectionMode && images.isNotEmpty)
           IconButton(
             tooltip: 'Share document',
             onPressed: processing ? null : _shareDocument,
@@ -4384,7 +5048,7 @@ class _DocumentPageState extends State<DocumentPage> {
                   )
                 : const Icon(Icons.share),
           ),
-        if (images.isNotEmpty)
+        if (!_isImageSelectionMode && images.isNotEmpty)
           IconButton(
             tooltip: 'Download document',
             onPressed: saving ? null : _downloadDocument,
@@ -4487,7 +5151,11 @@ class _DocumentPageState extends State<DocumentPage> {
                           return LongPressDraggable<String>(
                             data: file.path,
                             maxSimultaneousDrags: _isReordering ? 0 : 1,
-                            delay: const Duration(milliseconds: 150),
+                            onDragStarted: () {
+                              if (!_selectedImages.contains(file.path)) {
+                                _toggleImageSelection(file);
+                              }
+                            },
                             feedback: Material(
                               elevation: 8,
                               borderRadius: BorderRadius.circular(12),
@@ -4500,7 +5168,14 @@ class _DocumentPageState extends State<DocumentPage> {
                             ),
                             child: DecoratedBox(
                               decoration: BoxDecoration(
-                                border: isDropTarget
+                                border: _selectedImages.contains(file.path)
+                                    ? Border.all(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                        width: 3,
+                                      )
+                                    : isDropTarget
                                     ? Border.all(
                                         color: Theme.of(
                                           context,
@@ -4515,7 +5190,13 @@ class _DocumentPageState extends State<DocumentPage> {
                                 children: [
                                   Positioned.fill(
                                     child: GestureDetector(
-                                      onTap: () => _openImageEditor(file),
+                                      onTap: () {
+                                        if (_isImageSelectionMode) {
+                                          _toggleImageSelection(file);
+                                        } else {
+                                          _openImageEditor(file);
+                                        }
+                                      },
                                       child: ClipRRect(
                                         borderRadius: BorderRadius.circular(12),
                                         child: Image.file(
@@ -4544,6 +5225,22 @@ class _DocumentPageState extends State<DocumentPage> {
                                       ),
                                     ),
                                   ),
+                                  if (_selectedImages.contains(file.path))
+                                    Positioned(
+                                      top: 8,
+                                      right: 8,
+                                      child: CircleAvatar(
+                                        radius: 14,
+                                        backgroundColor: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                        child: const Icon(
+                                          Icons.check,
+                                          size: 18,
+                                          color: Colors.white,
+                                        ),
+                                      ),
+                                    ),
                                   Positioned(
                                     top: 8,
                                     left: 8,
@@ -4598,27 +5295,28 @@ class _DocumentPageState extends State<DocumentPage> {
                                       ),
                                     ),
                                   ),
-                                  Positioned(
-                                    top: 8,
-                                    right: 8,
-                                    child: IconButton(
-                                      onPressed: () => _remove(file),
-                                      padding: EdgeInsets.zero,
-                                      constraints: const BoxConstraints(
-                                        minWidth: 26,
-                                        minHeight: 26,
-                                      ),
-                                      icon: const CircleAvatar(
-                                        radius: 13,
-                                        backgroundColor: Colors.black54,
-                                        child: Icon(
-                                          Icons.close,
-                                          size: 16,
-                                          color: Colors.white,
+                                  if (!_isImageSelectionMode)
+                                    Positioned(
+                                      top: 8,
+                                      right: 8,
+                                      child: IconButton(
+                                        onPressed: () => _remove(file),
+                                        padding: EdgeInsets.zero,
+                                        constraints: const BoxConstraints(
+                                          minWidth: 26,
+                                          minHeight: 26,
+                                        ),
+                                        icon: const CircleAvatar(
+                                          radius: 13,
+                                          backgroundColor: Colors.black54,
+                                          child: Icon(
+                                            Icons.close,
+                                            size: 16,
+                                            color: Colors.white,
+                                          ),
                                         ),
                                       ),
                                     ),
-                                  ),
                                 ],
                               ),
                             ),
@@ -4683,9 +5381,16 @@ class _PdfPreviewPageState extends State<PdfPreviewPage> {
       }
       return;
     }
+    if (!mounted) return;
 
-    await widget.document.directory.rename(destination.path);
-    widget.document.directory = destination;
+    await runWithProgressDialog(
+      context,
+      message: 'Renaming document...',
+      action: () async {
+        await widget.document.directory.rename(destination.path);
+        widget.document.directory = destination;
+      },
+    );
 
     if (!mounted) return;
     setState(() {});

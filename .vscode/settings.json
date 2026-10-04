@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^flutter analyze lib\\\\main\\.dart$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

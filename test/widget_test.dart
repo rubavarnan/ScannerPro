@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -14,6 +15,95 @@ void main() {
 
     expect(find.byType(MaterialApp), findsOneWidget);
     expect(find.byType(HomePage), findsOneWidget);
+  });
+
+  testWidgets('progress dialog stays visible until the action completes', (
+    WidgetTester tester,
+  ) async {
+    final completer = Completer<void>();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Builder(
+          builder: (context) => Scaffold(
+            body: ElevatedButton(
+              onPressed: () async {
+                await runWithProgressDialog<void>(
+                  context,
+                  message: 'Saving...',
+                  action: () => completer.future,
+                );
+              },
+              child: const Text('Save'),
+            ),
+          ),
+        ),
+      ),
+    );
+
+    await tester.tap(find.text('Save'));
+    await tester.pump();
+    await tester.pump();
+    expect(find.text('Saving...'), findsOneWidget);
+    expect(find.byType(CircularProgressIndicator), findsOneWidget);
+
+    completer.complete();
+    await tester.pumpAndSettle();
+    expect(find.text('Saving...'), findsNothing);
+  });
+
+  test('collage layouts expand with the selected image count', () {
+    expect(collageLayoutsForImageCount(1), [
+      (1, 1),
+      (1, 2),
+      (1, 3),
+      (2, 1),
+      (2, 2),
+      (2, 3),
+      (3, 1),
+      (3, 2),
+      (3, 3),
+      (4, 1),
+      (4, 2),
+      (4, 3),
+    ]);
+    expect(collageLayoutsForImageCount(5), [
+      (2, 3),
+      (3, 2),
+      (3, 3),
+      (4, 2),
+      (4, 3),
+    ]);
+    expect(collageLayoutsForImageCount(12), [(4, 3)]);
+    expect(collageLayoutsForImageCount(13), isEmpty);
+  });
+
+  test('drag reorder inserts at the actual target index', () {
+    final files = [File('1.jpg'), File('2.jpg'), File('3.jpg')];
+
+    expect(reorderFilesForDrag(files, 0, 1), [files[1], files[0], files[2]]);
+    expect(reorderFilesForDrag(files, 0, 2), [files[1], files[2], files[0]]);
+    expect(reorderFilesForDrag(files, 2, 0), [files[2], files[0], files[1]]);
+  });
+
+  test('document created date stays stable when images are added', () async {
+    final tempDir = await Directory.systemTemp.createTemp(
+      'scanner_pro_document_date_test_',
+    );
+    addTearDown(() => tempDir.delete(recursive: true));
+    final documentDirectory = Directory('${tempDir.path}/Document')
+      ..createSync();
+    final firstImage = File('${documentDirectory.path}/1.jpg')
+      ..writeAsBytesSync([1, 2, 3]);
+    final document = DocumentFolder(documentDirectory);
+
+    await document.preserveCreatedDate();
+    final createdDate = document.createdDate;
+    final firstImageLength = firstImage.lengthSync();
+    File('${documentDirectory.path}/2.jpg').writeAsBytesSync([4, 5]);
+
+    final reloadedDocument = DocumentFolder(documentDirectory);
+    expect(reloadedDocument.createdDate, createdDate);
+    expect(reloadedDocument.sizeBytes, firstImageLength + 2);
   });
 
   testWidgets('swiping between edited images asks before leaving', (
